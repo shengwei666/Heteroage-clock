@@ -50,8 +50,7 @@ The system utilizes a hierarchical approach to balance global population trends 
 | **Serialization** | `joblib`, `pickle` | Artifact deployment and model persistence. |
 | **Bioinformatics** | `pyarrow` | Optimized Parquet I/O for large methylome data. |
 
-### Option A: Standard Installation (Recommended)
-Best for reproducing results and running the pipeline.
+### Option A: git clone
 
 ```bash
 # 1. Clone the repository
@@ -63,6 +62,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. Install dependencies
+#pip install --upgrade pip
 pip install -e .
 ```
 
@@ -76,6 +76,7 @@ conda create -n heteroage-clock-env python=3.9
 conda activate heteroage-clock-env
 
 # Install dependencies
+#pip install --upgrade pip
 pip install -e .
 ```
 ---
