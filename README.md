@@ -4,7 +4,7 @@
 
 **An industrial-grade, three-stage biological age prediction pipeline designed for high-performance and reproducible aging research.**
 
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Code Style](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](http://makeapullrequest.com)
@@ -70,7 +70,7 @@ pip install -e .
 
 ```bash
 # Create a virtual environment
-conda create -n heteroage-clock-env python=3.9
+conda create -n heteroage-clock-env python=3.8
 
 # Activate the virtual environment.
 conda activate heteroage-clock-env
