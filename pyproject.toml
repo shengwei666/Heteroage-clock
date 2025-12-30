@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "heteroage-clock"
+version = "0.1.0"
+description = "An industrial-grade, three-stage biological age prediction pipeline"
+authors = ["Shengwei Li <lishengwei98@tongji.edu.cn>"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "heteroage_clock" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "joblib",
+    "lightgbm",
+    "pre-commit",
+    "click",
+    "pytest",
+    "matplotlib",
+    "seaborn",
+    "scipy",
+]
+
+[tool.poetry.dev-dependencies]
+black = "^22.3.0"
+flake8 = "^4.0.1"
+pytest = "^7.1.2"
+pytest-cov = "^3.0.0"
+mypy = "^0.910"
+isort = "^5.9.3"
+tox = "^3.24.4"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

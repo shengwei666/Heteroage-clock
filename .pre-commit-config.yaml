@@ -1,0 +1,64 @@
+# .pre-commit-config.yaml
+
+# See https://pre-commit.com/ for more information on configuring hooks.
+# For a list of available hooks, see: https://pre-commit.com/hooks.html
+
+repos:
+  - repo: https://github.com/prettier/miscellaneous
+    rev: v2.7.1
+    hooks:
+      - id: prettier
+
+  - repo: https://github.com/psf/black
+    rev: 21.9b0
+    hooks:
+      - id: black
+        language_version: python3
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: v3.9.1
+    hooks:
+      - id: flake8
+        additional_dependencies:
+          - flake8-bugbear
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v0.910
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - mypy
+
+  - repo: https://github.com/psf/black
+    rev: v21.9b0
+    hooks:
+      - id: black
+        args:
+          - --check
+          - --diff
+        files: \.(py)$
+
+  - repo: https://github.com/pycqa/isort
+    rev: v5.9.3
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  - repo: https://github.com/pre-commit/mirrors-terraform
+    rev: v2.0.1
+    hooks:
+      - id: terraform_fmt
+        files: \.tf$
+
+  - repo: https://github.com/pre-commit/mirrors-pylint
+    rev: v2.10.2
+    hooks:
+      - id: pylint
+        language_version: python3
+
+  - repo: https://github.com/tmcw/prettier-plugin-python
+    rev: v2.7.1
+    hooks:
+      - id: prettier
+        files: \.py$
+

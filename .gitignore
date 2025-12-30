@@ -1,0 +1,51 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.whl
+*.egg-info/
+.eggs/
+
+# Virtual environment
+.venv/
+env/
+venv/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Build and distribution directories
+build/
+dist/
+*.egg-info/
+
+# Poetry lock file, not required when using a pip-based environment
+poetry.lock
+
+# Pytest
+.cache/
+.pytest_cache/
+
+# IDE specific
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+
+# MacOS specific files
+.DS_Store
+
+# Windows specific files
+Thumbs.db
+
+# Configuration files
+*.ini
+*.cfg
+*.env
