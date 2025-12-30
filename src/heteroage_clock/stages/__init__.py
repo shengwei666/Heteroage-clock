@@ -1,7 +1,19 @@
 """
 heteroage_clock.stages
 
-This module contains the core pipeline logic for each stage of the biological age prediction process.
-Each stage (Stage 1, Stage 2, Stage 3) handles a specific aspect of model training and inference.
-The stages are executed sequentially, each improving upon the previous one with a more refined model.
+This module exposes the core training and inference functions for each stage
+of the biological age prediction pipeline.
 """
+
+from .stage1 import train_stage1, predict_stage1
+from .stage2 import train_stage2, predict_stage2
+from .stage3 import train_stage3, predict_stage3
+
+__all__ = [
+    "train_stage1", 
+    "predict_stage1",
+    "train_stage2", 
+    "predict_stage2",
+    "train_stage3", 
+    "predict_stage3",
+]

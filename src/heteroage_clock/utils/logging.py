@@ -2,48 +2,57 @@
 heteroage_clock.utils.logging
 
 This module defines logging utilities that are used across the pipeline.
-It ensures consistent logging, including timestamped log entries and configurable verbosity.
+It ensures consistent logging with a singleton logger to prevent duplicate outputs.
 """
 
 import logging
-from datetime import datetime
+import sys
+from typing import Optional
 
+# Define a global logger name
+LOGGER_NAME = "heteroage_clock"
 
-def setup_logger(name: str, log_level: str = "INFO") -> logging.Logger:
+def setup_logger(name: str = LOGGER_NAME, log_level: str = "INFO") -> logging.Logger:
     """
-    Sets up a logger for pipeline processes, providing timestamped and level-controlled logs.
-
+    Sets up a logger if it hasn't been configured yet.
+    
     Args:
         name (str): Name of the logger.
-        log_level (str, optional): The log level (DEBUG, INFO, WARNING, ERROR, CRITICAL). Default is 'INFO'.
-
+        log_level (str): Log level.
+        
     Returns:
-        logging.Logger: A logger instance.
+        logging.Logger: The configured logger.
     """
     logger = logging.getLogger(name)
     logger.setLevel(log_level.upper())
-
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-    # Create console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(log_level.upper())
-    ch.setFormatter(formatter)
-
-    # Add handler to logger
-    logger.addHandler(ch)
+    
+    # Check if handlers already exist to avoid duplicate logs
+    if not logger.handlers:
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        
+        # Create console handler
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(log_level.upper())
+        ch.setFormatter(formatter)
+        
+        logger.addHandler(ch)
+        
+        # Prevent propagation to root logger (optional, keeps output clean)
+        logger.propagate = False
 
     return logger
 
+# Initialize the logger once at module level
+_logger = setup_logger()
 
 def log(msg: str, level: str = "INFO") -> None:
     """
-    Log a message with a specified level.
+    Log a message using the global singleton logger.
 
     Args:
         msg (str): The log message.
         level (str, optional): The level of logging (DEBUG, INFO, WARNING, ERROR, CRITICAL). Default is 'INFO'.
     """
-    logger = setup_logger("heteroage_logger", log_level="INFO")
-    log_func = getattr(logger, level.lower(), logger.info)
+    # Map string level to method
+    log_func = getattr(_logger, level.lower(), _logger.info)
     log_func(msg)

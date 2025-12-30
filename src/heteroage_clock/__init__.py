@@ -1,5 +1,6 @@
 """
-heteroage_clock
-
-Main package for the heteroage-clock project. It includes the core functionality for biological age prediction.
+HeteroAge-Clock Top-level package.
 """
+
+__version__ = "0.1.0"
+__author__ = "Shengwei Li"

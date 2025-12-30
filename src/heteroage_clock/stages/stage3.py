@@ -2,67 +2,166 @@
 heteroage_clock.stages.stage3
 
 Stage 3: Context-Aware Fusion
-
-This stage fuses Stage 1 global predictions and Stage 2 hallmark corrections using a LightGBM model,
-incorporating biological context (such as Tissue, Sex, and PCs). The result is a final biological age prediction.
 """
 
 import os
 import pandas as pd
+import numpy as np
 import lightgbm as lgb
+from sklearn.base import clone
 from heteroage_clock.core.metrics import compute_regression_metrics
+from heteroage_clock.core.age_transform import AgeTransformer
+from heteroage_clock.core.splits import make_stratified_group_folds
 from heteroage_clock.utils.logging import log
+from heteroage_clock.artifacts.stage3 import Stage3Artifact
 
-
-def stage3_train(project_root: str, output_dir: str, stage1_oof_path: str, stage2_oof_path: str, pc_path: str) -> None:
-    """
-    Train the Stage 3 model using LightGBM, fusing Stage 1 and Stage 2 outputs with context features.
+def train_stage3(project_root: str, output_dir: str, stage1_oof_path: str, stage2_oof_path: str, pc_path: str) -> None:
+    artifact_handler = Stage3Artifact(output_dir)
     
-    Args:
-        project_root (str): Path to the project root directory.
-        output_dir (str): Directory to save the output models and reports.
-        stage1_oof_path (str): Path to Stage 1 OOF predictions CSV.
-        stage2_oof_path (str): Path to Stage 2 OOF predictions CSV.
-        pc_path (str): Path to Principal Components (PCs) CSV file.
-    """
-    # Step 1: Load necessary data
-    log(f"Loading Stage 1 OOF predictions from {stage1_oof_path}...")
+    # 1. Load Data
+    log(f"Loading Stage 1 OOF from {stage1_oof_path}...")
     stage1_oof = pd.read_csv(stage1_oof_path)
 
-    log(f"Loading Stage 2 OOF predictions from {stage2_oof_path}...")
+    log(f"Loading Stage 2 OOF from {stage2_oof_path}...")
     stage2_oof = pd.read_csv(stage2_oof_path)
 
-    log(f"Loading Principal Components (PCs) from {pc_path}...")
+    log(f"Loading PCs from {pc_path}...")
     pc_data = pd.read_csv(pc_path)
 
-    # Step 2: Merge data (Stage 1 OOF, Stage 2 OOF, and PC context)
-    merged_data = stage1_oof.merge(stage2_oof, on="sample_id", suffixes=("_stage1", "_stage2"))
-    merged_data = merged_data.merge(pc_data, on="sample_id", how="left")
+    # 2. Merge Data
+    log("Merging OOF data for Fusion...")
+    merged_data = pd.merge(stage1_oof, stage2_oof, on="sample_id", how="inner")
+    merged_data = pd.merge(merged_data, pc_data, on="sample_id", how="inner")
+    
+    if "Sex_encoded" not in merged_data.columns and "Sex" in merged_data.columns:
+        merged_data["Sex_encoded"] = merged_data["Sex"].map({"F": 0, "M": 1, "Female": 0, "Male": 1}).fillna(0)
+    
+    # 3. Define Features
+    feature_cols = []
+    if "pred_age" in merged_data.columns:
+        feature_cols.append("pred_age")
+    
+    hallmark_cols = [c for c in merged_data.columns if c.startswith("pred_residual_")]
+    feature_cols.extend(hallmark_cols)
+    
+    pc_cols = [c for c in merged_data.columns if c.startswith("RF_PC")]
+    feature_cols.extend(pc_cols)
+    
+    if "Sex_encoded" in merged_data.columns:
+        feature_cols.append("Sex_encoded")
+    
+    log(f"Fusion Features ({len(feature_cols)}): Hallmarks={len(hallmark_cols)}, Context={len(pc_cols)}")
 
-    # Step 3: Prepare data for LightGBM
-    features = ["pred_age_stage1", "pred_residual_stage2"] + [col for col in pc_data.columns if col.startswith("RF_PC")]
-    X = merged_data[features]
+    X = merged_data[feature_cols]
     y = merged_data["age"]
+    sample_ids = merged_data["sample_id"]
+    
+    # 4. Transform Target (Log-Linear)
+    trans = AgeTransformer(adult_age=20)
+    y_trans = trans.transform(y.values)
 
-    # Step 4: Train LightGBM model
-    model = lgb.LGBMRegressor(random_state=42, n_estimators=2000, learning_rate=0.01)
-    model.fit(X, y)
+    # 5. Stratified Group K-Fold CV
+    # We rely on Stage 1 OOF passing 'project_id' and 'Tissue'
+    if "project_id" in merged_data.columns and "Tissue" in merged_data.columns:
+        groups = merged_data["project_id"]
+        tissues = merged_data["Tissue"]
+        folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=5, seed=42)
+    else:
+        log("Warning: 'project_id' or 'Tissue' missing in merged data. Falling back to KFold.")
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        folds = list(kf.split(X, y_trans))
 
-    # Step 5: Evaluate the model
-    val_predictions = model.predict(X)
-    metrics = compute_regression_metrics(y, val_predictions)
+    oof_preds_linear = np.zeros(len(y))
+    model_params = {'random_state': 42, 'n_estimators': 2000, 'learning_rate': 0.01, 'n_jobs': -1, 'verbose': -1}
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train_trans = y_trans[train_idx]
+        
+        model_fold = lgb.LGBMRegressor(**model_params)
+        model_fold.fit(X_train, y_train_trans)
+        
+        val_preds_trans = model_fold.predict(X_val)
+        val_preds_linear = trans.inverse_transform(val_preds_trans)
+        oof_preds_linear[val_idx] = val_preds_linear
 
-    # Log performance
-    log(f"Stage 3 (Fusion) - Metrics: {metrics}")
+    metrics = compute_regression_metrics(y, oof_preds_linear)
+    log(f"Stage 3 OOF Metrics: {metrics}")
 
-    # Step 6: Save results
-    os.makedirs(output_dir, exist_ok=True)
-    model_path = os.path.join(output_dir, "stage3_model.joblib")
-    pd.to_pickle(model, model_path)
+    # 6. Retrain Final Model
+    log("Retraining final Meta-Learner...")
+    final_model = lgb.LGBMRegressor(**model_params)
+    final_model.fit(X, y_trans)
 
-    # Save final predictions
-    final_predictions_path = os.path.join(output_dir, "Stage3_Final_Predictions.csv")
-    pd.DataFrame({"sample_id": merged_data["sample_id"], "final_pred_age": val_predictions}).to_csv(final_predictions_path, index=False)
+    importance_df = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': final_model.feature_importances_
+    }).sort_values(by='importance', ascending=False)
 
-    log(f"Stage 3 model saved to {model_path}")
-    log(f"Stage 3 final predictions saved to {final_predictions_path}")
+    artifact_handler.save_meta_learner_model(final_model)
+    artifact_handler.save("stage3_features", feature_cols)
+    artifact_handler.save_attention_importance(importance_df)
+    
+    oof_df = pd.DataFrame({
+        "sample_id": sample_ids,
+        "age": y,
+        "final_pred_age": oof_preds_linear,
+        "final_residual": y - oof_preds_linear
+    })
+    artifact_handler.save_oof_predictions(oof_df)
+    log(f"Stage 3 completed.")
+
+
+def predict_stage3(artifact_dir: str, input_path: str, output_path: str) -> None:
+    """
+    Predict using Stage 3 Meta-Learner.
+    """
+    artifact_handler = Stage3Artifact(artifact_dir)
+    
+    log(f"Loading Stage 3 model from {artifact_dir}...")
+    model = artifact_handler.load_meta_learner_model()
+    feature_cols = artifact_handler.load("stage3_features")
+    
+    log(f"Loading merged input data from {input_path}...")
+    if input_path.endswith('.csv'):
+        data = pd.read_csv(input_path)
+    else:
+        data = pd.read_pickle(input_path)
+
+    if "Sex_encoded" in feature_cols and "Sex_encoded" not in data.columns:
+        if "Sex" in data.columns:
+             data["Sex_encoded"] = data["Sex"].map({"F": 0, "M": 1, "Female": 0, "Male": 1}).fillna(0)
+        else:
+             data["Sex_encoded"] = 0
+        
+    if "pred_age_stage1" in data.columns and "pred_age" not in data.columns:
+        data["pred_age"] = data["pred_age_stage1"]
+
+    missing = [c for c in feature_cols if c not in data.columns]
+    if missing:
+        log(f"Warning: Stage 3 Input missing {len(missing)} columns. Filling with 0.")
+        for c in missing:
+            data[c] = 0.0
+            
+    X = data[feature_cols]
+    
+    log("Running Stage 3 Final Inference...")
+    preds_trans = model.predict(X)
+    
+    trans = AgeTransformer(adult_age=20)
+    preds_linear = trans.inverse_transform(preds_trans)
+    
+    output_df = pd.DataFrame()
+    if "sample_id" in data.columns:
+        output_df["sample_id"] = data["sample_id"]
+        
+    output_df["final_pred_age"] = preds_linear
+    
+    if "age" in data.columns:
+        output_df["age"] = data["age"]
+        output_df["final_residual"] = output_df["age"] - output_df["final_pred_age"]
+        
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_df.to_csv(output_path, index=False)
+    log(f"Stage 3 Final Predictions saved to {output_path}")

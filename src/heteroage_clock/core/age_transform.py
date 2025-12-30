@@ -1,70 +1,78 @@
-# age_transform.py
+"""
+heteroage_clock.core.age_transform
+
+Implements the Log-Linear transformation for biological age.
+Based on the Horvath clock methodology:
+- Logarithmic scale for young ages (development).
+- Linear scale for adult ages (aging).
+"""
 
 import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
 
-class AgeTransformer:
-    """
-    Class for transforming biological age between raw age and transformed age for model input.
-    
-    This transformer is used to adjust the age distribution to ensure that both the younger and older age groups 
-    are appropriately represented for machine learning models.
-    
-    Transforms raw age to a log-transformed age for model training, and allows inverse transformation 
-    back to the original age scale for interpretation.
-    """
-    
-    def __init__(self, adult_age=20):
+class AgeTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, adult_age: float = 20.0):
         """
-        Initialize the AgeTransformer with an offset for adult age.
-
-        Parameters:
-        - adult_age: The threshold age to separate childhood and adulthood. Default is 20.
+        Args:
+            adult_age (float): The age threshold where development ends and aging begins.
+                               Standard value is 20.
         """
         self.adult_age = adult_age
-        self.age_offset = adult_age + 1
-        self.log_offset = np.log(self.age_offset)
 
-    def transform(self, age):
-        """
-        Transform raw biological age to a model-friendly representation (log transformation for younger ages,
-        and linear transformation for older ages).
-        
-        Parameters:
-        - age: A numpy array or list of biological ages to be transformed.
-        
-        Returns:
-        - Transformed age in model-friendly format (log-transformed or scaled).
-        """
-        age = np.asarray(age, dtype=float)
-        mask = (age <= self.adult_age)
-        y = np.empty_like(age)
-        
-        # Log transformation for ages <= adult_age
-        y[mask] = np.log(np.maximum(age[mask], 0) + 1.0) - self.log_offset
-        
-        # Linear transformation for ages > adult_age
-        y[~mask] = (age[~mask] - self.adult_age) / self.age_offset
-        
-        return y
+    def fit(self, X, y=None):
+        return self
 
-    def inverse_transform(self, y):
+    def transform(self, age: np.ndarray) -> np.ndarray:
         """
-        Inverse transformation to convert the model-friendly representation back to raw age scale.
+        Transform chronological age to the log-linear scale.
         
-        Parameters:
-        - y: A numpy array or list of transformed ages to be converted back to the raw scale.
-        
-        Returns:
-        - Raw biological age in original scale.
+        Formula:
+        - If age <= adult_age: log((age + 1) / (adult_age + 1))
+        - If age > adult_age:  (age - adult_age) / (adult_age + 1)
         """
-        y = np.asarray(y, dtype=float)
-        mask = (y <= 0)
-        age = np.empty_like(y)
+        age = np.array(age).astype(float)
         
-        # Inverse log transformation for ages <= adult_age
-        age[mask] = np.exp(y[mask] + self.log_offset) - 1.0
+        # Calculate transformation
+        # Case 1: Young (Logarithmic)
+        # Note: We usually align so that at adult_age, value is 0. 
+        # But Horvath's F function typically aligns differently. 
+        # Let's use the standard Horvath-style transformation logic:
+        # F(age) = log(age+1) - log(adult+1)    if age <= adult
+        # F(age) = (age - adult)/(adult+1)      if age > adult
         
-        # Inverse linear transformation for ages > adult_age
-        age[~mask] = y[~mask] * self.age_offset + self.adult_age
+        # Vectorized implementation
+        transformed = np.zeros_like(age)
         
-        return age
+        mask_young = age <= self.adult_age
+        mask_old = ~mask_young
+        
+        if np.any(mask_young):
+            transformed[mask_young] = np.log(age[mask_young] + 1) - np.log(self.adult_age + 1)
+            
+        if np.any(mask_old):
+            transformed[mask_old] = (age[mask_old] - self.adult_age) / (self.adult_age + 1)
+            
+        return transformed
+
+    def inverse_transform(self, transformed_age: np.ndarray) -> np.ndarray:
+        """
+        Convert transformed values back to chronological age (years).
+        
+        Inverse Formula:
+        - If y < 0: (adult_age + 1) * exp(y) - 1
+        - If y >= 0: y * (adult_age + 1) + adult_age
+        """
+        transformed_age = np.array(transformed_age).astype(float)
+        original_age = np.zeros_like(transformed_age)
+        
+        # Threshold 0 corresponds to adult_age in the transform above
+        mask_young = transformed_age < 0
+        mask_old = ~mask_young
+        
+        if np.any(mask_young):
+            original_age[mask_young] = (self.adult_age + 1) * np.exp(transformed_age[mask_young]) - 1
+            
+        if np.any(mask_old):
+            original_age[mask_old] = transformed_age[mask_old] * (self.adult_age + 1) + self.adult_age
+            
+        return original_age

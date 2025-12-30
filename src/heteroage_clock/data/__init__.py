@@ -1,12 +1,19 @@
 """
 heteroage_clock.data
 
-This module handles data loading, preprocessing, and feature assembly.
-It includes utility functions for reading data, joining multiple modalities,
-and assembling the final feature set for model training.
-
-Functions:
-    - Data loading functions for modalities.
-    - Assembly and feature extraction functions.
-    - Utility functions for merging data and generating master tables.
+Data handling utilities for the pipeline.
+This module includes:
+- Feature assembly and alignment
+- Missing value imputation
+- Input/Output operations (CSV/Parquet/Pickle)
 """
+
+from .assemble import assemble_features, filter_and_impute
+from .io import load_data, save_predictions
+
+__all__ = [
+    "assemble_features",
+    "filter_and_impute",
+    "load_data",
+    "save_predictions",
+]

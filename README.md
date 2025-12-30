@@ -62,7 +62,7 @@ python -m venv .venv
 source .venv/bin/activate
 
 # 3. Install dependencies
-#pip install --upgrade pip
+pip install --upgrade pip
 pip install -e .
 ```
 
@@ -76,8 +76,8 @@ conda create -n heteroage-clock-env python=3.8
 conda activate heteroage-clock-env
 
 # Install dependencies
-#pip install --upgrade pip
-pip install -e .
+conda install -c conda-forge poetry
+poetry install
 ```
 ---
 ## ✨3. Data Requirements

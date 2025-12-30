@@ -1,8 +1,22 @@
-# __init__.py
 """
-This is the core module of the heteroage-clock package. It contains essential functionalities that support the main pipeline,
-such as data transformation, sampling, model selection, and evaluation metrics. All utility functions and class definitions
-that are crucial for the proper functioning of the age prediction pipeline are implemented here.
+heteroage_clock.core
+
+Core mathematical and statistical components of the clock.
+This module includes:
+- Age transformation logic (Log-Linear)
+- Performance metrics (MAE, R2, HeteroAge Score)
+- Sampling strategies (Stratified Group K-Fold, Adaptive Sampling)
 """
 
-# Ensure that everything in this module is correctly initialized and available for use.
+from .age_transform import AgeTransformer
+from .metrics import compute_regression_metrics, heteroage_score, RegressionMetrics
+from .sampling import adaptive_sampler, make_stratified_group_folds
+
+__all__ = [
+    "AgeTransformer",
+    "compute_regression_metrics",
+    "heteroage_score",
+    "RegressionMetrics",
+    "adaptive_sampler",
+    "make_stratified_group_folds",
+]

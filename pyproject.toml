@@ -5,18 +5,18 @@ description = "An industrial-grade, three-stage biological age prediction pipeli
 authors = ["Shengwei Li <lishengwei98@tongji.edu.cn>"]
 license = "MIT"
 readme = "README.md"
-packages = [{ include = "heteroage_clock" }]
+packages = [{ include = "heteroage_clock", from = "src" }]
+[tool.poetry.scripts]
+heteroage-clock = "heteroage_clock.cli:main"
 
 [tool.poetry.dependencies]
 python = "^3.8"
 numpy = "^1.21.0"
-pandas = "^1.2.5"
-scikit-learn = "^0.24.2"
+pandas = "^1.3.0"
+scikit-learn = "^1.0.0"
 joblib = "^1.0.0"
 lightgbm = "^3.1.0"
-pre-commit = "^2.0.0"
 click = "^8.0.1"
-pytest = "^7.1.2"
 matplotlib = "^3.4.3"
 seaborn = "^0.11.1"
 scipy = "^1.7.0"
@@ -29,6 +29,7 @@ pytest-cov = "^3.0.0"
 mypy = "^0.910"
 isort = "^5.9.3"
 tox = "^3.24.4"
+pre-commit = "^2.0.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

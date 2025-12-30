@@ -1,14 +1,7 @@
-# __init__.py
 """
-Artifacts module for heteroage-clock.
+heteroage_clock.artifacts
 
-This module handles the loading, saving, and management of artifacts (models, weights, results)
-produced during the training process in the biological age prediction pipeline.
-
-Artifacts include:
-    - Models: Serialized trained models.
-    - Weights: Feature importance weights.
-    - Residuals: Stage-wise residual corrections.
+Artifact management classes for handling model serialization and IO.
 """
 
 from .base import BaseArtifact
