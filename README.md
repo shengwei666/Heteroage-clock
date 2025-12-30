@@ -55,30 +55,28 @@ Best for reproducing results and running the pipeline.
 
 ```bash
 # 1. Clone the repository
-git clone [https://github.com/shengwei666/heteroage-clock.git](https://github.com/shengwei666/heteroage-clock.git)
+git clone https://github.com/shengwei666/Heteroage-clock.git
 cd heteroage-clock
 
 # 2. Create and activate virtual environment
 python -m venv .venv
-source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+source .venv/bin/activate
 
 # 3. Install dependencies
-pip install --upgrade pip
 pip install -e .
 ```
 
-### Option B: Developer Extras
-Includes tools for linting, formatting, and testing.
+### Option B: Use conda to create and manage virtual environments.
 
 ```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
+# Create a virtual environment
+conda create -n heteroage-clock-env python=3.9
 
-# Install pre-commit hooks
-pre-commit install
+# Activate the virtual environment.
+conda activate heteroage-clock-env
 
-# Verify installation
-heteroage --help
+# Install dependencies
+pip install -e .
 ```
 ---
 ## ✨3. Data Requirements
