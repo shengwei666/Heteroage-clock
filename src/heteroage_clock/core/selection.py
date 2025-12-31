@@ -1,59 +1,100 @@
 """
 heteroage_clock.core.selection
 
-Feature selection algorithms, specifically for Hallmark Orthogonalization.
+Feature selection algorithms.
+Implements Correlation-based Ranking & Orthogonalization (Winner-Takes-All by Rank).
+This ensures stable, deterministic feature assignment across Hallmarks.
 """
 
 import numpy as np
+import pandas as pd
 from typing import List, Dict
-from sklearn.linear_model import ElasticNetCV
+from collections import defaultdict
 from heteroage_clock.utils.logging import log
 
-def select_features_internal(
+def fast_correlation(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Calculate Pearson correlation coefficient between each column of X and y.
+    Vectorized implementation for high performance.
+    """
+    n = X.shape[0]
+    if n < 2:
+        return np.zeros(X.shape[1])
+
+    X_mean = X.mean(axis=0)
+    y_mean = y.mean()
+    X_centered = X - X_mean
+    y_centered = y - y_mean
+    
+    X_std = X.std(axis=0)
+    y_std = y.std()
+    
+    # Avoid division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        corrs = np.dot(X_centered.T, y_centered) / (n * X_std * y_std + 1e-12)
+    
+    return np.nan_to_num(corrs, nan=0.0)
+
+def orthogonalize_by_correlation(
     X: np.ndarray, 
     y: np.ndarray, 
     feature_names: List[str], 
     hallmark_mapping: Dict[str, List[str]]
-) -> List[str]:
+) -> Dict[str, List[str]]:
     """
-    Selects orthogonal features for each hallmark using ElasticNet.
+    Performs orthogonalization based on Correlation Ranking.
     
-    Args:
-        X: Feature matrix (N_samples, N_features).
-        y: Target vector.
-        feature_names: List of feature names corresponding to X columns.
-        hallmark_mapping: Dict mapping Hallmark_Name -> List[Feature_Names_with_Suffix].
-        
-    Returns:
-        List[str]: The list of selected (orthogonal) feature names.
+    Logic:
+    1. Calculate correlation of ALL features with y (Age/Residual).
+    2. For each Hallmark, rank its features by abs(correlation).
+    3. If a feature appears in multiple Hallmarks, assign it to the one 
+       where it has the highest relative rank (smallest rank index).
+       
+    This provides a STABLE definition of Hallmarks.
     """
-    selected_features_set = set()
+    log("  > Calculating global correlations for ranking...")
     
-    # Map feature name to column index for fast access
-    name_to_idx = {name: i for i, name in enumerate(feature_names)}
+    # 1. Global Correlation Calculation
+    corrs = fast_correlation(X, y)
+    abs_corrs = np.abs(corrs)
     
-    for hallmark, feats in hallmark_mapping.items():
-        # Find indices for this hallmark's features
-        indices = [name_to_idx[f] for f in feats if f in name_to_idx]
+    # Map feature name -> correlation score
+    feat_score_map = dict(zip(feature_names, abs_corrs))
+    
+    # 2. Calculate Rank within each Hallmark
+    # feature -> list of (hallmark, rank)
+    feature_ranks = defaultdict(list)
+    
+    for h, feats in hallmark_mapping.items():
+        # Only consider features present in our dataset
+        valid_feats = [f for f in feats if f in feat_score_map]
         
-        if not indices:
+        if not valid_feats:
             continue
+
+        # Sort features by correlation (descending) -> Best feature is Rank 0
+        sorted_feats = sorted(valid_feats, key=lambda f: feat_score_map[f], reverse=True)
+        
+        # Record rank (0-based index)
+        for rank, f in enumerate(sorted_feats):
+            feature_ranks[f].append((h, rank))
             
-        X_sub = X[:, indices]
+    # 3. Resolve Conflicts (Winner-Takes-All by Rank)
+    final_ortho_dict = defaultdict(list)
+    
+    for f, possibilities in feature_ranks.items():
+        if len(possibilities) == 1:
+            # No conflict
+            best_h = possibilities[0][0]
+        else:
+            # Conflict: Choose the hallmark where this feature ranks highest (smallest rank index)
+            # Tie-breaker: sort by hallmark name to be deterministic
+            best_h = min(possibilities, key=lambda x: (x[1], x[0]))[0]
+            
+        final_ortho_dict[best_h].append(f)
         
-        # Use a lighter setup for rapid selection
-        selector = ElasticNetCV(cv=3, random_state=42, n_jobs=-1, max_iter=1000)
-        selector.fit(X_sub, y)
-        
-        # Extract non-zero coefs
-        coefs = selector.coef_
-        selected_mask = coefs != 0
-        
-        # Map back to names
-        subset_names = [feats[i] for i, is_selected in enumerate(selected_mask) if is_selected]
-        
-        if len(subset_names) > 0:
-            log(f"  > Hallmark '{hallmark}': Selected {len(subset_names)} / {len(feats)} features.")
-            selected_features_set.update(subset_names)
-        
-    return list(selected_features_set)
+    return dict(final_ortho_dict)
+
+# Compatibility stub
+def select_features_internal(*args, **kwargs):
+    raise NotImplementedError("Use orthogonalize_by_correlation instead.")

@@ -1,136 +1,172 @@
 """
 heteroage_clock.cli
 
-This module provides the command-line interface (CLI) for running the heteroage-clock pipeline.
-It allows users to execute different stages of the pipeline, including training and inference, from the terminal.
+Command Line Interface.
+Exposes all file paths and hyperparameters as arguments.
 """
 
 import argparse
-from .pipeline import (
-    train_stage1, train_stage2, train_stage3, 
-    predict_pipeline, predict_stage1, predict_stage2, predict_stage3
-)
+import sys
+import os
+from heteroage_clock.stages.stage1 import train_stage1, predict_stage1
+from heteroage_clock.stages.stage2 import train_stage2, predict_stage2
+from heteroage_clock.stages.stage3 import train_stage3, predict_stage3
+from heteroage_clock.utils.logging import log
 
-def create_parser():
-    """
-    Create and return the argument parser for the CLI.
-    """
-    parser = argparse.ArgumentParser(description="heteroage-clock CLI")
-    subparsers = parser.add_subparsers(dest="command")
-
-    # ==========================================
-    # Training Commands
-    # ==========================================
-
-    # Stage 1 Train Command
-    stage1_train = subparsers.add_parser("stage1-train", help="Train Stage 1 (Global Anchor)")
-    stage1_train.add_argument("--project-root", required=True, help="Root directory for project data")
-    stage1_train.add_argument("--output-dir", required=True, help="Directory to save Stage 1 outputs")
-    stage1_train.add_argument("--pc-path", required=True, help="Path to the PCs CSV file")
-    stage1_train.add_argument("--dict-name", required=True, help="Filename of the Hallmark CpG dictionary (e.g. Hallmark_CpG_Dict.json)")
-    stage1_train.add_argument("--sweep-file", help="Path to existing sweep report to skip the sweep step")
-
-    # Stage 2 Train Command
-    stage2_train = subparsers.add_parser("stage2-train", help="Train Stage 2 (Hallmark Experts)")
-    stage2_train.add_argument("--project-root", required=True, help="Root directory for project data")
-    stage2_train.add_argument("--output-dir", required=True, help="Directory to save Stage 2 outputs")
-    stage2_train.add_argument("--pc-path", required=True, help="Path to the PCs CSV file")
-    stage2_train.add_argument("--stage1-oof", required=True, help="Path to Stage 1 OOF predictions CSV")
-    stage2_train.add_argument("--stage1-dict", required=True, help="Filename of the Stage 1 Hallmark dictionary (e.g. Hallmark_CpG_Dict.json)")
-
-    # Stage 3 Train Command
-    stage3_train = subparsers.add_parser("stage3-train", help="Train Stage 3 (Context-Aware Fusion)")
-    stage3_train.add_argument("--project-root", required=False, help="Root directory for project data (optional, for logging)")
-    stage3_train.add_argument("--output-dir", required=True, help="Directory to save Stage 3 outputs")
-    stage3_train.add_argument("--stage1-oof", required=True, help="Path to Stage 1 OOF predictions CSV")
-    stage3_train.add_argument("--stage2-oof", required=True, help="Path to Stage 2 OOF predictions CSV")
-    stage3_train.add_argument("--pc-path", required=True, help="Path to the PCs CSV file")
-
-    # ==========================================
-    # Inference Commands
-    # ==========================================
-
-    # Pipeline Predict Command (Full)
-    pipeline_predict = subparsers.add_parser("pipeline-predict", help="Run full pipeline inference (Stage 1 -> 2 -> 3)")
-    pipeline_predict.add_argument("--artifact-dir", required=True, help="Root directory containing stage1/stage2/stage3 artifacts")
-    pipeline_predict.add_argument("--input", required=True, help="Path to the master input table (CSV or Pickle)")
-    pipeline_predict.add_argument("--out", required=True, help="Path to save final predictions")
-
-    # Stage 1 Predict Command
-    stage1_predict = subparsers.add_parser("stage1-predict", help="Run Stage 1 inference only")
-    stage1_predict.add_argument("--artifact-dir", required=True, help="Directory containing Stage 1 artifacts")
-    stage1_predict.add_argument("--input", required=True, help="Path to input table")
-    stage1_predict.add_argument("--out", required=True, help="Path to save predictions")
-
-    # Stage 2 Predict Command
-    stage2_predict = subparsers.add_parser("stage2-predict", help="Run Stage 2 inference only")
-    stage2_predict.add_argument("--artifact-dir", required=True, help="Directory containing Stage 2 artifacts")
-    stage2_predict.add_argument("--input", required=True, help="Path to input table")
-    stage2_predict.add_argument("--out", required=True, help="Path to save predictions")
-
-    # Stage 3 Predict Command
-    stage3_predict = subparsers.add_parser("stage3-predict", help="Run Stage 3 inference only")
-    stage3_predict.add_argument("--artifact-dir", required=True, help="Directory containing Stage 3 artifacts")
-    stage3_predict.add_argument("--input", required=True, help="Path to merged input table")
-    stage3_predict.add_argument("--out", required=True, help="Path to save predictions")
-
-    return parser
+def resolve_path(arg_path, project_root, default_rel_path):
+    if arg_path: return arg_path
+    if project_root:
+        potential_path = os.path.join(project_root, default_rel_path)
+        if os.path.exists(potential_path): return potential_path
+    return None
 
 def main():
-    """
-    Main function to parse arguments and run the appropriate pipeline function.
-    """
-    parser = create_parser()
+    parser = argparse.ArgumentParser(description="HeteroAge-Clock CLI")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # --- Stage 1 Train ---
+    p_s1 = subparsers.add_parser("stage1-train", help="Train Stage 1 Global Anchor")
+    p_s1.add_argument("--project-root", type=str, help="Root directory for default path inference")
+    p_s1.add_argument("--output-dir", type=str, required=True, help="Directory to save artifacts")
+    
+    # Input Files
+    p_s1.add_argument("--pc-path", type=str, help="Path to PC covariates CSV")
+    p_s1.add_argument("--dict-path", type=str, help="Path to Hallmark JSON Dictionary")
+    p_s1.add_argument("--beta-path", type=str, help="Path to Beta Value Pickle")
+    p_s1.add_argument("--chalm-path", type=str, help="Path to Chalm Value Pickle")
+    p_s1.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
+    p_s1.add_argument("--sweep-file", type=str, help="Optional sweep file")
+    
+    # Hyperparameters
+    p_s1.add_argument("--alpha-start", type=float, default=-4.0, help="Log10 start of alpha range")
+    p_s1.add_argument("--alpha-end", type=float, default=-0.5, help="Log10 end of alpha range")
+    p_s1.add_argument("--n-alphas", type=int, default=30, help="Number of alphas")
+    p_s1.add_argument("--l1-ratio", type=float, default=0.5, help="ElasticNet mixing parameter")
+    p_s1.add_argument("--n-splits", type=int, default=5, help="Number of CV splits")
+    p_s1.add_argument("--seed", type=int, default=42, help="Random seed")
+    p_s1.add_argument("--max-iter", type=int, default=2000, help="Max iterations for solver")
+
+    # --- Stage 2 Train ---
+    p_s2 = subparsers.add_parser("stage2-train", help="Train Stage 2 Hallmark Experts")
+    p_s2.add_argument("--project-root", type=str, help="Root directory for default path inference")
+    p_s2.add_argument("--output-dir", type=str, required=True)
+    
+    # Input Files
+    p_s2.add_argument("--stage1-oof", type=str, help="Path to Stage 1 OOF CSV")
+    p_s2.add_argument("--stage1-dict", type=str, help="Path to Stage 1 Orthogonalized Dict")
+    p_s2.add_argument("--pc-path", type=str, help="Path to PC covariates")
+    p_s2.add_argument("--beta-path", type=str, help="Path to Beta Value Pickle")
+    p_s2.add_argument("--chalm-path", type=str, help="Path to Chalm Value Pickle")
+    p_s2.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
+    
+    # Hyperparameters (Same as Stage 1)
+    p_s2.add_argument("--alpha-start", type=float, default=-4.0)
+    p_s2.add_argument("--alpha-end", type=float, default=-0.5)
+    p_s2.add_argument("--n-alphas", type=int, default=30)
+    p_s2.add_argument("--l1-ratio", type=float, default=0.5)
+    p_s2.add_argument("--n-splits", type=int, default=5)
+    p_s2.add_argument("--seed", type=int, default=42)
+    p_s2.add_argument("--max-iter", type=int, default=2000)
+
+    # --- Stage 3 Train ---
+    p_s3 = subparsers.add_parser("stage3-train", help="Train Stage 3 Context Fusion")
+    p_s3.add_argument("--project-root", type=str, help="Root directory for default path inference")
+    p_s3.add_argument("--output-dir", type=str, required=True)
+    
+    # Input Files
+    p_s3.add_argument("--stage1-oof", type=str, help="Path to Stage 1 OOF CSV")
+    p_s3.add_argument("--stage2-oof", type=str, help="Path to Stage 2 OOF CSV")
+    p_s3.add_argument("--pc-path", type=str, help="Path to PC covariates")
+    
+    # Hyperparameters (LightGBM)
+    p_s3.add_argument("--n-estimators", type=int, default=2000)
+    p_s3.add_argument("--learning-rate", type=float, default=0.01)
+    p_s3.add_argument("--num-leaves", type=int, default=31)
+    p_s3.add_argument("--max-depth", type=int, default=-1)
+    p_s3.add_argument("--n-splits", type=int, default=5)
+    p_s3.add_argument("--seed", type=int, default=42)
+
     args = parser.parse_args()
 
     if args.command == "stage1-train":
+        pc = resolve_path(args.pc_path, args.project_root, "4.Data_assembly/Feature_Sets/RefGuided_PCs.csv")
+        dic = resolve_path(args.dict_path, args.project_root, "4.Data_assembly/Feature_Sets/Hallmark_CpG_Dict_Final.json")
+        beta = resolve_path(args.beta_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Beta_Train_RefGuided_NoCpH.pkl")
+        chalm = resolve_path(args.chalm_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Chalm_Train_RefGuided_NoCpH.pkl")
+        camda = resolve_path(args.camda_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Camda_Train_RefGuided_NoCpH.pkl")
+
+        if not all([pc, dic, beta, chalm, camda]):
+            log("Error: Missing input files. Provide explicit paths or valid --project-root.")
+            sys.exit(1)
+
         train_stage1(
-            project_root=args.project_root,
             output_dir=args.output_dir,
-            pc_path=args.pc_path,
-            dict_name=args.dict_name,
-            sweep_file=args.sweep_file
+            pc_path=pc,
+            dict_path=dic,
+            beta_path=beta,
+            chalm_path=chalm,
+            camda_path=camda,
+            sweep_file=args.sweep_file,
+            alpha_start=args.alpha_start,
+            alpha_end=args.alpha_end,
+            n_alphas=args.n_alphas,
+            l1_ratio=args.l1_ratio,
+            n_splits=args.n_splits,
+            seed=args.seed,
+            max_iter=args.max_iter
         )
+
     elif args.command == "stage2-train":
+        s1_oof = args.stage1_oof
+        s1_dict = args.stage1_dict
+        pc = resolve_path(args.pc_path, args.project_root, "4.Data_assembly/Feature_Sets/RefGuided_PCs.csv")
+        beta = resolve_path(args.beta_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Beta_Train_RefGuided_NoCpH.pkl")
+        chalm = resolve_path(args.chalm_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Chalm_Train_RefGuided_NoCpH.pkl")
+        camda = resolve_path(args.camda_path, args.project_root, "4.Data_assembly/Raw_Aligned_RefGuided/Camda_Train_RefGuided_NoCpH.pkl")
+
+        if not all([s1_oof, s1_dict, pc, beta, chalm, camda]):
+             log("Error: Missing input files for Stage 2.")
+             sys.exit(1)
+
         train_stage2(
-            project_root=args.project_root,
             output_dir=args.output_dir,
-            pc_path=args.pc_path,
-            stage1_oof=args.stage1_oof,
-            stage1_dict=args.stage1_dict
+            stage1_oof_path=s1_oof,
+            stage1_dict_path=s1_dict,
+            pc_path=pc,
+            beta_path=beta,
+            chalm_path=chalm,
+            camda_path=camda,
+            alpha_start=args.alpha_start,
+            alpha_end=args.alpha_end,
+            n_alphas=args.n_alphas,
+            l1_ratio=args.l1_ratio,
+            n_splits=args.n_splits,
+            seed=args.seed,
+            max_iter=args.max_iter
         )
+
     elif args.command == "stage3-train":
+        s1_oof = args.stage1_oof
+        s2_oof = args.stage2_oof
+        pc = resolve_path(args.pc_path, args.project_root, "4.Data_assembly/Feature_Sets/RefGuided_PCs.csv")
+        
+        if not all([s1_oof, s2_oof, pc]):
+             log("Error: Missing input files for Stage 3.")
+             sys.exit(1)
+             
         train_stage3(
-            stage1_oof=args.stage1_oof,
-            stage2_oof=args.stage2_oof,
-            pc_path=args.pc_path,
             output_dir=args.output_dir,
-            project_root=args.project_root
+            stage1_oof_path=s1_oof,
+            stage2_oof_path=s2_oof,
+            pc_path=pc,
+            n_estimators=args.n_estimators,
+            learning_rate=args.learning_rate,
+            num_leaves=args.num_leaves,
+            max_depth=args.max_depth,
+            n_splits=args.n_splits,
+            seed=args.seed
         )
-    elif args.command == "pipeline-predict":
-        predict_pipeline(
-            artifact_dir=args.artifact_dir,
-            input_path=args.input,
-            output_path=args.out
-        )
-    elif args.command == "stage1-predict":
-        predict_stage1(
-            artifact_dir=args.artifact_dir,
-            input_path=args.input,
-            output_path=args.out
-        )
-    elif args.command == "stage2-predict":
-        predict_stage2(
-            artifact_dir=args.artifact_dir,
-            input_path=args.input,
-            output_path=args.out
-        )
-    elif args.command == "stage3-predict":
-        predict_stage3(
-            artifact_dir=args.artifact_dir,
-            input_path=args.input,
-            output_path=args.out
-        )
+
     else:
         parser.print_help()
 

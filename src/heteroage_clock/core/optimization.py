@@ -2,7 +2,7 @@
 heteroage_clock.core.optimization
 
 Hyperparameter optimization routines.
-Specifically implements the 'Macro + Micro' strategy for Heterogeneity-Adjusted training.
+Specifically implements the 'Macro + Micro' strategy.
 """
 
 import numpy as np
@@ -17,48 +17,40 @@ def tune_elasticnet_macro_micro(
     groups: Any, 
     tissues: Any, 
     trans_func: Optional[Any] = None, 
-    seed: int = 42
+    # Hyperparameters with defaults
+    alpha_start: float = -4.0,
+    alpha_end: float = -0.5,
+    n_alphas: int = 30,
+    l1_ratio: float = 0.5,
+    n_splits: int = 5,
+    seed: int = 42,
+    max_iter: int = 2000
 ) -> ElasticNet:
     """
     Performs Grid Search to find the ElasticNet alpha that maximizes (Micro_R + Macro_R).
-    
-    Args:
-        X: Feature matrix.
-        y: Target vector (Transformed space if trans_func provided).
-        groups: Group labels for splitting (e.g. project_id).
-        tissues: Stratification labels (e.g. Tissue).
-        trans_func: Optional transformer (e.g. AgeTransformer) with .inverse_transform.
-                    If provided, metrics are calculated in the original linear space.
-                    If None, metrics are calculated directly on y.
-    
-    Returns:
-        best_model: The ElasticNet model initialized with the best alpha.
+    All search parameters are now configurable.
     """
-    # 1. Define Search Space (Log-space alphas)
-    # Range covers strong regularization (1e-0.5) to weak (1e-4)
-    alphas = np.logspace(-4, -0.5, 30) 
-    l1_ratio = 0.5  # Fixed mixing parameter
+    # Generate search space dynamically
+    alphas = np.logspace(alpha_start, alpha_end, n_alphas) 
     
-    # 2. Define Fixed Splits for Fairness
-    # All alphas must be evaluated on the EXACT same folds
-    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=5, seed=seed)
+    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
     
     if not folds:
         log("Warning: Split failed in optimization. Returning default model.")
         return ElasticNet(alpha=0.01, l1_ratio=l1_ratio, random_state=seed)
 
     best_score = -np.inf
-    best_alpha = alphas[len(alphas)//2] # Default to middle
-    results = []
-
-    # log(f"  > Tuning alpha on {len(alphas)} candidates...")
+    best_alpha = alphas[len(alphas)//2]
+    
+    # Use a smaller max_iter for the search loop to speed it up, 
+    # but use full max_iter for the final model.
+    search_max_iter = max(1000, max_iter // 2)
 
     for alpha in alphas:
         oof_preds = np.zeros(len(y))
         fold_corrs = []
         
-        # Use a lighter max_iter for search speed
-        model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=1000)
+        model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=search_max_iter)
         
         for train_idx, val_idx in folds:
             X_train, X_val = X[train_idx], X[val_idx]
@@ -67,7 +59,6 @@ def tune_elasticnet_macro_micro(
             model.fit(X_train, y_train)
             pred = model.predict(X_val)
             
-            # Handle Transformation (Log -> Linear) for Metric Calculation
             if trans_func:
                 pred_eval = trans_func.inverse_transform(pred)
                 y_val_eval = trans_func.inverse_transform(y_val)
@@ -75,21 +66,16 @@ def tune_elasticnet_macro_micro(
                 pred_eval = pred
                 y_val_eval = y_val
             
-            # Store OOF (Linear space for Micro calc if transformed)
             oof_preds[val_idx] = pred_eval
             
-            # Calculate Fold Metric (Pearson R)
             if np.std(pred_eval) > 1e-9 and np.std(y_val_eval) > 1e-9:
                 r_fold = np.corrcoef(y_val_eval, pred_eval)[0, 1]
             else:
                 r_fold = 0.0
             fold_corrs.append(r_fold)
             
-        # --- Compute Composite Score ---
-        # 1. Macro R: Average of per-fold correlations
         macro_r = np.mean(fold_corrs)
         
-        # 2. Micro R: Correlation of concatenated predictions
         if trans_func:
             y_eval_all = trans_func.inverse_transform(y)
         else:
@@ -108,5 +94,5 @@ def tune_elasticnet_macro_micro(
             
     log(f"  > Best Alpha: {best_alpha:.5f} (Score: {best_score:.4f})")
     
-    # Return new model with best params and higher max_iter for final training
-    return ElasticNet(alpha=best_alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=2000)
+    # Return new model with best params and FULL max_iter
+    return ElasticNet(alpha=best_alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=max_iter)

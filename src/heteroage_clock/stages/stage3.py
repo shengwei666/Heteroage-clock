@@ -15,7 +15,23 @@ from heteroage_clock.core.splits import make_stratified_group_folds
 from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage3 import Stage3Artifact
 
-def train_stage3(project_root: str, output_dir: str, stage1_oof_path: str, stage2_oof_path: str, pc_path: str) -> None:
+def train_stage3(
+    output_dir: str, 
+    stage1_oof_path: str, 
+    stage2_oof_path: str, 
+    pc_path: str,
+    # Hyperparameters
+    n_estimators: int = 2000,
+    learning_rate: float = 0.01,
+    num_leaves: int = 31,
+    max_depth: int = -1,
+    n_splits: int = 5,
+    seed: int = 42
+) -> None:
+    """
+    Train Stage 3 Meta-Learner.
+    Accepts explicit paths and hyperparameters.
+    """
     artifact_handler = Stage3Artifact(output_dir)
     
     # 1. Load Data
@@ -29,7 +45,6 @@ def train_stage3(project_root: str, output_dir: str, stage1_oof_path: str, stage
     pc_data = pd.read_csv(pc_path)
 
     # 2. Merge Data
-    log("Merging OOF data for Fusion...")
     merged_data = pd.merge(stage1_oof, stage2_oof, on="sample_id", how="inner")
     merged_data = pd.merge(merged_data, pc_data, on="sample_id", how="inner")
     
@@ -61,19 +76,28 @@ def train_stage3(project_root: str, output_dir: str, stage1_oof_path: str, stage
     y_trans = trans.transform(y.values)
 
     # 5. Stratified Group K-Fold CV
-    # We rely on Stage 1 OOF passing 'project_id' and 'Tissue'
     if "project_id" in merged_data.columns and "Tissue" in merged_data.columns:
         groups = merged_data["project_id"]
         tissues = merged_data["Tissue"]
-        folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=5, seed=42)
+        folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
     else:
-        log("Warning: 'project_id' or 'Tissue' missing in merged data. Falling back to KFold.")
+        log("Warning: 'project_id' or 'Tissue' missing. Falling back to simple KFold.")
         from sklearn.model_selection import KFold
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         folds = list(kf.split(X, y_trans))
 
     oof_preds_linear = np.zeros(len(y))
-    model_params = {'random_state': 42, 'n_estimators': 2000, 'learning_rate': 0.01, 'n_jobs': -1, 'verbose': -1}
+    
+    # Construct LightGBM params from arguments
+    model_params = {
+        'random_state': seed,
+        'n_estimators': n_estimators,
+        'learning_rate': learning_rate,
+        'num_leaves': num_leaves,
+        'max_depth': max_depth,
+        'n_jobs': -1,
+        'verbose': -1
+    }
     
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -112,13 +136,9 @@ def train_stage3(project_root: str, output_dir: str, stage1_oof_path: str, stage
     artifact_handler.save_oof_predictions(oof_df)
     log(f"Stage 3 completed.")
 
-
+# predict_stage3 logic remains same
 def predict_stage3(artifact_dir: str, input_path: str, output_path: str) -> None:
-    """
-    Predict using Stage 3 Meta-Learner.
-    """
     artifact_handler = Stage3Artifact(artifact_dir)
-    
     log(f"Loading Stage 3 model from {artifact_dir}...")
     model = artifact_handler.load_meta_learner_model()
     feature_cols = artifact_handler.load("stage3_features")
@@ -140,13 +160,9 @@ def predict_stage3(artifact_dir: str, input_path: str, output_path: str) -> None
 
     missing = [c for c in feature_cols if c not in data.columns]
     if missing:
-        log(f"Warning: Stage 3 Input missing {len(missing)} columns. Filling with 0.")
-        for c in missing:
-            data[c] = 0.0
+        for c in missing: data[c] = 0.0
             
     X = data[feature_cols]
-    
-    log("Running Stage 3 Final Inference...")
     preds_trans = model.predict(X)
     
     trans = AgeTransformer(adult_age=20)

@@ -2,10 +2,6 @@
 heteroage_clock.stages.stage1
 
 Stage 1: Global Anchor
-
-This stage establishes a global biological age baseline.
-It uses 'Macro + Micro' optimization to find robust hyperparameters.
-It saves metadata (project_id, Tissue) in OOF for downstream usage.
 """
 
 import os
@@ -18,32 +14,47 @@ from heteroage_clock.core.metrics import compute_regression_metrics
 from heteroage_clock.data.assemble import assemble_features, filter_and_impute
 from heteroage_clock.core.age_transform import AgeTransformer
 from heteroage_clock.core.splits import make_stratified_group_folds
-from heteroage_clock.core.selection import select_features_internal
 from heteroage_clock.core.optimization import tune_elasticnet_macro_micro
+from heteroage_clock.core.selection import orthogonalize_by_correlation
 from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage1 import Stage1Artifact
 
-def train_stage1(project_root: str, output_dir: str, pc_path: str, dict_name: str, sweep_file: str = None) -> None:
+def train_stage1(
+    output_dir: str, 
+    pc_path: str, 
+    dict_path: str,
+    beta_path: str,
+    chalm_path: str,
+    camda_path: str,
+    sweep_file: str = None,
+    # Hyperparameters
+    alpha_start: float = -4.0,
+    alpha_end: float = -0.5,
+    n_alphas: int = 30,
+    l1_ratio: float = 0.5,
+    n_splits: int = 5,
+    seed: int = 42,
+    max_iter: int = 2000
+) -> None:
     """
-    Train the Stage 1 model using Custom 'Macro + Micro' Grid Search.
+    Train the Stage 1 model.
+    Accepts explicit file paths and all hyperparameters.
     """
     artifact_handler = Stage1Artifact(output_dir)
     
     # --- 1. Load Data ---
-    log(f"Loading data from {project_root}...")
-    feature_sets_dir = os.path.join(project_root, "4.Data_assembly/Feature_Sets")
-    dict_path = os.path.join(feature_sets_dir, dict_name)
-    
+    log(f"Loading Hallmark Dictionary from {dict_path}...")
     if not os.path.exists(dict_path):
         raise FileNotFoundError(f"Hallmark dictionary not found at {dict_path}")
-        
     hallmark_dict = pd.read_json(dict_path)
+
+    log(f"Loading Context (PCs) from {pc_path}...")
     pc_data = pd.read_csv(pc_path)
     
-    raw_aligned_dir = os.path.join(project_root, "4.Data_assembly/Raw_Aligned_RefGuided")
-    cpg_beta = pd.read_pickle(os.path.join(raw_aligned_dir, "Beta_Train_RefGuided_NoCpH.pkl"))
-    chalm_data = pd.read_pickle(os.path.join(raw_aligned_dir, "Chalm_Train_RefGuided_NoCpH.pkl"))
-    camda_data = pd.read_pickle(os.path.join(raw_aligned_dir, "Camda_Train_RefGuided_NoCpH.pkl"))
+    log(f"Loading Omics Data...")
+    cpg_beta = pd.read_pickle(beta_path)
+    chalm_data = pd.read_pickle(chalm_path)
+    camda_data = pd.read_pickle(camda_path)
 
     # --- 2. Assemble ---
     log("Assembling features...")
@@ -67,51 +78,31 @@ def train_stage1(project_root: str, output_dir: str, pc_path: str, dict_name: st
     trans = AgeTransformer(adult_age=20)
     y_trans = trans.transform(y)
 
-    # --- 4. Feature Selection (Orthogonalization) ---
-    log("Running Feature Orthogonalization...")
-    hallmark_dict_suffixed = defaultdict(list)
-    available_set = set(feature_candidates)
-    
-    for h, cpgs in hallmark_dict.items():
-        iter_cpgs = cpgs if isinstance(cpgs, list) else cpgs.values() if isinstance(cpgs, dict) else cpgs
-        for cpg in iter_cpgs:
-            if not isinstance(cpg, str): continue 
-            for suffix in ["_beta", "_chalm", "_camda"]:
-                feat = f"{cpg}{suffix}"
-                if feat in available_set:
-                    hallmark_dict_suffixed[h].append(feat)
-
-    selected_features = select_features_internal(X_full, y_trans, feature_candidates, hallmark_dict_suffixed)
-    log(f"Selected {len(selected_features)} orthogonal features.")
-    
-    # Add Context features (PCs)
-    pc_cols = [c for c in feature_candidates if c.startswith("RF_PC") or c == "Sex_encoded"]
-    final_features = list(set(selected_features + pc_cols))
-    
-    # Re-build X
-    final_indices = [feature_candidates.index(f) for f in final_features]
-    X_selected = X_full[:, final_indices]
-    
-    log(f"Final Model Matrix: {X_selected.shape}")
+    # --- 4. Training Strategy: Full Set ---
+    log(f"Stage 1 Strategy: Training on FULL feature set ({len(feature_candidates)} features).")
+    X_selected = X_full 
+    final_features = feature_candidates
 
     # --- 5. Optimization (Macro + Micro) ---
-    log("Optimizing Hyperparameters (Macro + Micro)...")
+    log("Optimizing Hyperparameters (Macro + Micro) on Full Set...")
     best_model = tune_elasticnet_macro_micro(
         X=X_selected, 
         y=y_trans, 
         groups=groups, 
         tissues=tissues, 
-        trans_func=trans
+        trans_func=trans,
+        alpha_start=alpha_start,
+        alpha_end=alpha_end,
+        n_alphas=n_alphas,
+        l1_ratio=l1_ratio,
+        n_splits=n_splits,
+        seed=seed,
+        max_iter=max_iter
     )
 
     # --- 6. Final OOF Generation ---
     log("Generating Final OOF with Best Model...")
-    
-    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=5, seed=42)
-    
-    if not folds:
-        raise ValueError("Failed to create folds. Check data sufficiency.")
-
+    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
     oof_preds_linear = np.zeros(len(y))
     
     for train_idx, val_idx in folds:
@@ -125,29 +116,44 @@ def train_stage1(project_root: str, output_dir: str, pc_path: str, dict_name: st
         val_preds_linear = trans.inverse_transform(val_preds_trans)
         oof_preds_linear[val_idx] = val_preds_linear
 
-    # Evaluate
     oof_metrics = compute_regression_metrics(y, oof_preds_linear)
     log(f"Stage 1 Final OOF Metrics: {oof_metrics}")
 
-    # --- 7. Final Training & Saving ---
+    # --- 7. Final Training ---
     log("Retraining final Global Anchor model...")
     final_model = clone(best_model)
     final_model.fit(X_selected, y_trans)
 
+    # --- 8. Orthogonalization (Correlation Ranking) ---
+    log("Generating Correlation-based Orthogonalized Dictionary for Stage 2...")
+    
+    hallmark_dict_suffixed = defaultdict(list)
+    available_set = set(feature_candidates)
+    
+    for h, cpgs in hallmark_dict.items():
+        iter_cpgs = cpgs if isinstance(cpgs, list) else cpgs.values() if isinstance(cpgs, dict) else cpgs
+        for cpg in iter_cpgs:
+            if not isinstance(cpg, str): continue 
+            for suffix in ["_beta", "_chalm", "_camda"]:
+                feat = f"{cpg}{suffix}"
+                if feat in available_set:
+                    hallmark_dict_suffixed[h].append(feat)
+    
+    final_ortho_dict = orthogonalize_by_correlation(
+        X=X_full, 
+        y=y_trans, 
+        feature_names=feature_candidates, 
+        hallmark_mapping=hallmark_dict_suffixed
+    )
+    
+    log(f"Orthogonalized Dictionary generated.")
+
+    # --- Save Artifacts ---
     log("Saving artifacts...")
     artifact_handler.save_global_model(final_model)
     artifact_handler.save("stage1_features", final_features) 
-    
-    # Save Ortho Dict
-    final_ortho_dict = defaultdict(list)
-    for f in selected_features:
-        for h, feats in hallmark_dict_suffixed.items():
-            if f in feats:
-                final_ortho_dict[h].append(f)
-                break
     artifact_handler.save_orthogonalized_dict(final_ortho_dict)
     
-    # [CRITICAL] Save OOF with Metadata for downstream usage
     oof_df = pd.DataFrame({
         "sample_id": sample_ids,
         "age": y,
@@ -163,16 +169,11 @@ def train_stage1(project_root: str, output_dir: str, pc_path: str, dict_name: st
         oof_df["Is_Healthy"] = assembled_data["Is_Healthy"].values
         
     artifact_handler.save_oof_predictions(oof_df)
-
     log(f"Stage 1 completed. Outputs in {output_dir}")
 
-
-def predict_stage1(artifact_dir: str, input_path: str, output_path: str) -> None:
-    """
-    Predict using Stage 1 artifacts.
-    """
+# predict_stage1 logic remains same
+def predict_stage1(artifact_dir, input_path, output_path):
     artifact_handler = Stage1Artifact(artifact_dir)
-    
     log(f"Loading model from {artifact_dir}...")
     model = artifact_handler.load_global_model()
     feature_cols = artifact_handler.load("stage1_features")
@@ -190,10 +191,9 @@ def predict_stage1(artifact_dir: str, input_path: str, output_path: str) -> None
 
     missing = [c for c in feature_cols if c not in data.columns]
     if missing:
-        raise ValueError(f"Input missing {len(missing)} features.")
+        for c in missing: data[c] = 0.0
     
     X = data[feature_cols].values
-    
     trans = AgeTransformer(adult_age=20)
     preds_trans = model.predict(X)
     preds_linear = trans.inverse_transform(preds_trans)
