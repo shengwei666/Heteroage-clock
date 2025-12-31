@@ -63,6 +63,9 @@ cd Heteroage-clock
 #conda activate heteroage-clock-env
 
 pip install -e .
+
+#heteroage --help
+#heteroage stage1-train --help
 ```
 **Note:** The `-e` flag stands for "editable". It allows you to modify the source code in `src/` and have the changes take effect immediately without re-installing.
 
@@ -79,6 +82,7 @@ cd Heteroage-clock
 #conda activate heteroage-clock-env
 
 pip install .
+#heteroage --help
 ```
 ---
 ## ✨3. Data Requirements
