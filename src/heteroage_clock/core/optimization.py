@@ -17,23 +17,15 @@ def tune_elasticnet_macro_micro(
     groups: Any, 
     tissues: Any, 
     trans_func: Optional[Any] = None, 
-    # Hyperparameters with defaults
-    alpha_start: float = -4.0,
-    alpha_end: float = -0.5,
-    n_alphas: int = 30,
-    l1_ratio: float = 0.5,
-    n_splits: int = 5,
-    seed: int = 42,
-    max_iter: int = 2000
+    seed: int = 42
 ) -> ElasticNet:
     """
     Performs Grid Search to find the ElasticNet alpha that maximizes (Micro_R + Macro_R).
-    All search parameters are now configurable.
     """
-    # Generate search space dynamically
-    alphas = np.logspace(alpha_start, alpha_end, n_alphas) 
+    alphas = np.logspace(-4, -0.5, 30) 
+    l1_ratio = 0.5
     
-    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
+    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=5, seed=seed)
     
     if not folds:
         log("Warning: Split failed in optimization. Returning default model.")
@@ -42,15 +34,11 @@ def tune_elasticnet_macro_micro(
     best_score = -np.inf
     best_alpha = alphas[len(alphas)//2]
     
-    # Use a smaller max_iter for the search loop to speed it up, 
-    # but use full max_iter for the final model.
-    search_max_iter = max(1000, max_iter // 2)
-
     for alpha in alphas:
         oof_preds = np.zeros(len(y))
         fold_corrs = []
         
-        model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=search_max_iter)
+        model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=1000)
         
         for train_idx, val_idx in folds:
             X_train, X_val = X[train_idx], X[val_idx]
@@ -93,6 +81,4 @@ def tune_elasticnet_macro_micro(
             best_alpha = alpha
             
     log(f"  > Best Alpha: {best_alpha:.5f} (Score: {best_score:.4f})")
-    
-    # Return new model with best params and FULL max_iter
-    return ElasticNet(alpha=best_alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=max_iter)
+    return ElasticNet(alpha=best_alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=2000)

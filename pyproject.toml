@@ -1,13 +1,15 @@
 [tool.poetry]
 name = "heteroage-clock"
-version = "0.1.0"
+version = "1.0.0"
 description = "An industrial-grade, three-stage biological age prediction pipeline"
 authors = ["Shengwei Li <lishengwei98@tongji.edu.cn>"]
 license = "MIT"
 readme = "README.md"
 packages = [{ include = "heteroage_clock", from = "src" }]
+
 [tool.poetry.scripts]
-heteroage-clock = "heteroage_clock.cli:main"
+# [FIX] Changed from 'heteroage-clock' to 'heteroage' to match README documentation
+heteroage = "heteroage_clock.cli:main"
 
 [tool.poetry.dependencies]
 python = "^3.8"
@@ -16,7 +18,7 @@ pandas = "^1.3.0"
 scikit-learn = "^1.0.0"
 joblib = "^1.0.0"
 lightgbm = "^3.1.0"
-click = "^8.0.1"
+# [FIX] Removed unused 'click' dependency
 matplotlib = "^3.4.3"
 seaborn = "^0.11.1"
 scipy = "^1.7.0"

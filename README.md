@@ -50,34 +50,29 @@ The system utilizes a hierarchical approach to balance global population trends 
 | **Serialization** | `joblib`, `pickle` | Artifact deployment and model persistence. |
 | **Bioinformatics** | `pyarrow` | Optimized Parquet I/O for large methylome data. |
 
-### Option A: git clone
+### Option A: Install from Source
+If you want to use the latest version or modify the code, install in **editable mode**:
 
 ```bash
 # 1. Clone the repository
 git clone https://github.com/shengwei666/Heteroage-clock.git
-cd heteroage-clock
+cd Heteroage-clock
 
-# 2. Create and activate virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# 3. Install dependencies
-pip install --upgrade pip
+# 2. Install dependencies and the package in editable mode
 pip install -e .
 ```
+**Note:** The `-e` flag stands for "editable". It allows you to modify the source code in `src/` and have the changes take effect immediately without re-installing.
 
-### Option B: Use conda to create and manage virtual environments.
+### Option B: Install as a Standard Package
+If you just want to use the tool without modifying it:
 
 ```bash
-# Create a virtual environment
-conda create -n heteroage-clock-env python=3.8
+# 1. Clone the repository
+git clone https://github.com/shengwei666/Heteroage-clock.git
+cd Heteroage-clock
 
-# Activate the virtual environment.
-conda activate heteroage-clock-env
-
-# Install dependencies
-conda install -c conda-forge poetry
-poetry install
+# 2. Install the package
+pip install .
 ```
 ---
 ## ✨3. Data Requirements
@@ -114,25 +109,30 @@ Each Pickle file (containing a pandas DataFrame) must include the following meta
 
 ## ✨ 4. Quick Start: Training
 
-The training process is executed in a **decoupled, stage-by-stage workflow**. This design ensures that each component can be validated independently before moving to the next, producing both analytical reports and deterministic inference artifacts.
+The training process is executed in a decoupled, stage-by-stage workflow. This design ensures that each component can be validated independently, producing both biological insights and deterministic inference artifacts.
 
 ---
 
 ### Stage 1: Global Anchor Training
-The Global Anchor establishes the baseline biological age by performing a wide parameter sweep to handle tissue heterogeneity across the global population.
+The Global Anchor establishes the baseline biological age.
 
 **Main Tasks:**
-* **Hyperparameter Sweep**: Iterates over sampling controls (`min_coh`, `max_cap`, `mult`, `lambda`) to optimize for heterogeneity.
-* **Leakage-free Evaluation**: Utilizes outer Cross-Validation (CV) for each configuration to ensure robust performance metrics.
-* **Artifact Generation**: Saves serialized model weights, scalers, and an orthogonalized Hallmark-CpG dictionary for downstream stages.
+* **Full-Set ElasticNet**: Learns from the union of all modalities (Beta, CHALM, CAMDA) to capture a comprehensive aging signal.
+* **Macro + Micro Optimization**: Performs a grid search for the best regularization (α) that balances global accuracy (Micro) and cross-dataset generalizability (Macro).
+* **Stable Orthogonalization**: Uses Pearson Correlation Ranking to assign overlapping CpG sites to the most biologically relevant Hallmark, ensuring Stage 2 experts are independent.
+* **Artifact Generation**: Saves the global model, the stable hallmark dictionary, and Out-of-Fold (OOF) residuals.
 
 ```bash
 # Execute Stage 1 Training
 heteroage stage1-train \
-  --project-root /path/to/project_root \
-  --output-dir /path/to/output_stage1 \
-  --pc-path /path/to/Global_Healthy_RF_PCs.csv \
-  --dict-name Hallmark_CpG_Dict_Final.json
+  --output-dir ./results/stage1 \
+  --pc-path ./data/RefGuided_PCs.csv \
+  --dict-path ./data/Hallmark_CpG_Dict_Final.json \
+  --beta-path ./data/Beta_Train.pkl \
+  --chalm-path ./data/Chalm_Train.pkl \
+  --camda-path ./data/Camda_Train.pkl \
+  --l1-ratio 0.5 \
+  --n-alphas 30
 ```
 **📂 Key Outputs:**
 

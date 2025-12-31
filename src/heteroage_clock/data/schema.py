@@ -1,66 +1,56 @@
 """
 heteroage_clock.data.schema
 
-This module defines the expected schema of input data (e.g., columns and feature types).
-It ensures that data is structured consistently across different stages of the pipeline.
+This module defines the expected schema of input data.
+Updates: Aligned column naming conventions with the new suffix logic (_beta, _chalm, _camda).
 """
 
 from typing import List
 
-
-# Define the expected feature set for each modality
 class DataSchema:
     """
-    Defines the expected columns for each modality (CpG beta, CHALM, CAMDA, PCs).
-    These schemas help ensure that the incoming data is structured correctly.
+    Defines the expected columns for each modality.
     """
 
     @staticmethod
     def get_cpg_columns() -> List[str]:
         """
-        Returns the list of expected CpG columns (e.g., cg00000029).
-
-        Returns:
-            List[str]: List of CpG column names.
+        Returns the list of expected CpG columns (Base ID).
+        Example: cg00000029
         """
-        return [f"cg{str(i).zfill(8)}" for i in range(1, 1001)]  # Example columns
+        return [f"cg{str(i).zfill(8)}" for i in range(1, 1001)]
+
+    @staticmethod
+    def get_beta_columns() -> List[str]:
+        """
+        Returns the list of expected Beta columns (Suffix: _beta).
+        """
+        return [f"cg{str(i).zfill(8)}_beta" for i in range(1, 1001)]
 
     @staticmethod
     def get_chalm_columns() -> List[str]:
         """
-        Returns the list of expected CHALM columns.
-
-        Returns:
-            List[str]: List of CHALM feature columns.
+        Returns the list of expected CHALM columns (Suffix: _chalm).
         """
-        return [f"chalm_{i}" for i in range(1, 51)]  # Example columns
+        return [f"cg{str(i).zfill(8)}_chalm" for i in range(1, 1001)]
 
     @staticmethod
     def get_camda_columns() -> List[str]:
         """
-        Returns the list of expected CAMDA columns.
-
-        Returns:
-            List[str]: List of CAMDA feature columns.
+        Returns the list of expected CAMDA columns (Suffix: _camda).
         """
-        return [f"camda_{i}" for i in range(1, 51)]  # Example columns
+        return [f"cg{str(i).zfill(8)}_camda" for i in range(1, 1001)]
 
     @staticmethod
     def get_pc_columns() -> List[str]:
         """
         Returns the list of expected RF_PC columns.
-
-        Returns:
-            List[str]: List of Principal Component columns.
         """
-        return [f"RF_PC{i}" for i in range(1, 21)]  # Example columns
+        return [f"RF_PC{i}" for i in range(1, 21)]
 
     @staticmethod
     def get_metadata_columns() -> List[str]:
         """
         Returns the expected metadata columns.
-
-        Returns:
-            List[str]: List of metadata columns (e.g., sample_id, tissue, age).
         """
-        return ['sample_id', 'project_id', 'tissue', 'age', 'sex']
+        return ['sample_id', 'project_id', 'Tissue', 'Age', 'Sex', 'Is_Healthy']

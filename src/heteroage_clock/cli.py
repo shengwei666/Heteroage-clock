@@ -8,9 +8,11 @@ Exposes all file paths and hyperparameters as arguments.
 import argparse
 import sys
 import os
-from heteroage_clock.stages.stage1 import train_stage1, predict_stage1
-from heteroage_clock.stages.stage2 import train_stage2, predict_stage2
-from heteroage_clock.stages.stage3 import train_stage3, predict_stage3
+# [CHANGE] Import from pipeline to maintain architecture
+from heteroage_clock.pipeline import (
+    train_stage1, train_stage2, train_stage3, 
+    predict_pipeline, predict_stage1, predict_stage2, predict_stage3
+)
 from heteroage_clock.utils.logging import log
 
 def resolve_path(arg_path, project_root, default_rel_path):
@@ -86,6 +88,28 @@ def main():
     p_s3.add_argument("--n-splits", type=int, default=5)
     p_s3.add_argument("--seed", type=int, default=42)
 
+    # --- Inference ---
+    p_pipe = subparsers.add_parser("pipeline-predict", help="Full Pipeline Inference")
+    p_pipe.add_argument("--artifact-dir", required=True)
+    p_pipe.add_argument("--input", required=True)
+    p_pipe.add_argument("--out", required=True)
+
+    # Stage 1-3 Predict (Optional shortcuts)
+    p_p1 = subparsers.add_parser("stage1-predict", help="Stage 1 Inference")
+    p_p1.add_argument("--artifact-dir", required=True)
+    p_p1.add_argument("--input", required=True)
+    p_p1.add_argument("--out", required=True)
+
+    p_p2 = subparsers.add_parser("stage2-predict", help="Stage 2 Inference")
+    p_p2.add_argument("--artifact-dir", required=True)
+    p_p2.add_argument("--input", required=True)
+    p_p2.add_argument("--out", required=True)
+
+    p_p3 = subparsers.add_parser("stage3-predict", help="Stage 3 Inference")
+    p_p3.add_argument("--artifact-dir", required=True)
+    p_p3.add_argument("--input", required=True)
+    p_p3.add_argument("--out", required=True)
+
     args = parser.parse_args()
 
     if args.command == "stage1-train":
@@ -113,7 +137,8 @@ def main():
             l1_ratio=args.l1_ratio,
             n_splits=args.n_splits,
             seed=args.seed,
-            max_iter=args.max_iter
+            max_iter=args.max_iter,
+            project_root=args.project_root
         )
 
     elif args.command == "stage2-train":
@@ -130,8 +155,8 @@ def main():
 
         train_stage2(
             output_dir=args.output_dir,
-            stage1_oof_path=s1_oof,
-            stage1_dict_path=s1_dict,
+            stage1_oof=s1_oof,
+            stage1_dict=s1_dict,
             pc_path=pc,
             beta_path=beta,
             chalm_path=chalm,
@@ -142,7 +167,8 @@ def main():
             l1_ratio=args.l1_ratio,
             n_splits=args.n_splits,
             seed=args.seed,
-            max_iter=args.max_iter
+            max_iter=args.max_iter,
+            project_root=args.project_root
         )
 
     elif args.command == "stage3-train":
@@ -156,16 +182,26 @@ def main():
              
         train_stage3(
             output_dir=args.output_dir,
-            stage1_oof_path=s1_oof,
-            stage2_oof_path=s2_oof,
+            stage1_oof=s1_oof,
+            stage2_oof=s2_oof,
             pc_path=pc,
             n_estimators=args.n_estimators,
             learning_rate=args.learning_rate,
             num_leaves=args.num_leaves,
             max_depth=args.max_depth,
             n_splits=args.n_splits,
-            seed=args.seed
+            seed=args.seed,
+            project_root=args.project_root
         )
+
+    elif args.command == "pipeline-predict":
+        predict_pipeline(args.artifact_dir, args.input, args.out)
+    elif args.command == "stage1-predict":
+        predict_stage1(args.artifact_dir, args.input, args.out)
+    elif args.command == "stage2-predict":
+        predict_stage2(args.artifact_dir, args.input, args.out)
+    elif args.command == "stage3-predict":
+        predict_stage3(args.artifact_dir, args.input, args.out)
 
     else:
         parser.print_help()
