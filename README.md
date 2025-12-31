@@ -59,6 +59,9 @@ git clone https://github.com/shengwei666/Heteroage-clock.git
 cd Heteroage-clock
 
 # 2. Install dependencies and the package in editable mode
+#conda create -n heteroage-clock-env python=3.8
+#conda activate heteroage-clock-env
+
 pip install -e .
 ```
 **Note:** The `-e` flag stands for "editable". It allows you to modify the source code in `src/` and have the changes take effect immediately without re-installing.
@@ -72,6 +75,9 @@ git clone https://github.com/shengwei666/Heteroage-clock.git
 cd Heteroage-clock
 
 # 2. Install the package
+#conda create -n heteroage-clock-env python=3.8
+#conda activate heteroage-clock-env
+
 pip install .
 ```
 ---
@@ -109,7 +115,7 @@ Each Pickle file (containing a pandas DataFrame) must include the following meta
 
 ## ✨ 4. Quick Start: Training
 
-The training process is executed in a decoupled, stage-by-stage workflow. This design ensures that each component can be validated independently, producing both biological insights and deterministic inference artifacts.
+The training process supports Parallel Grid Search and Hyperparameter Lists to significantly reduce computation time.
 
 ---
 
@@ -118,9 +124,8 @@ The Global Anchor establishes the baseline biological age.
 
 **Main Tasks:**
 * **Full-Set ElasticNet**: Learns from the union of all modalities (Beta, CHALM, CAMDA) to capture a comprehensive aging signal.
-* **Macro + Micro Optimization**: Performs a grid search for the best regularization (α) that balances global accuracy (Micro) and cross-dataset generalizability (Macro).
+* **Macro + Micro Optimization**: Performs a grid search for the best regularization (α and l1_ratio) that balances global accuracy (Micro) and cross-dataset generalizability (Macro).
 * **Stable Orthogonalization**: Uses Pearson Correlation Ranking to assign overlapping CpG sites to the most biologically relevant Hallmark, ensuring Stage 2 experts are independent.
-* **Artifact Generation**: Saves the global model, the stable hallmark dictionary, and Out-of-Fold (OOF) residuals.
 
 ```bash
 # Execute Stage 1 Training with Parallel Grid Search
@@ -139,81 +144,69 @@ heteroage stage1-train \
 
 | File / Directory | Description |
 | :--- | :--- |
-| `Stage1_Sweep_Report.csv` | Performance metrics and logs for all parameter sweep configurations. |
-| `Stage1_Orthogonalized_Hallmark_Dict.json` | Refined CpG-to-Hallmark mapping based on Stage 1 feature importance. |
-| `Stage1_Global_Anchor_OOF.csv` | Out-of-Fold predictions used as the training baseline for Stage 2. |
-| `Stage1_Global_Model_Weights.csv` | CSV export of the finalized ElasticNet coefficients. |
-| `artifacts/stage1/` | **Deployable Directory**: Contains serialized preprocessors and model artifacts. |
-
-> [!TIP]
-> **Efficiency Gain:** You can bypass the computationally intensive parameter sweep by reusing an existing report. This will trigger the final training phase using the best parameters found in that report.
-
-```bash
-# Skip sweep and train using the best parameters from a previous run
-heteroage stage1-train \
-  --project-root /path/to/project_root \
-  --output-dir /path/to/output_stage1 \
-  --pc-path /path/to/Global_Healthy_RF_PCs.csv \
-  --sweep-file /path/to/output_stage1/Stage1_Sweep_Report.csv
-```
+| `stage1_grid_search_report.csv` | Performance metrics for all tested hyperparameter combinations. |
+| `stage1_orthogonalized_dict.json` | Refined CpG-to-Hallmark mapping based on Stage 1 feature ranking. |
+| `stage1_oof_predictions.csv` | Out-of-Fold predictions used as the training baseline for Stage 2. |
+| `artifacts/stage1/` | **Deployable Directory**: Contains serialized ElasticNet model and feature indices. |
 
 ### Stage 2: Hallmark Experts Training
-
-Stage 2 focuses on **Residual Learning**. It trains independent "Expert" models (ElasticNetCV) to capture biological variations that the Global Anchor might miss, specifically focusing on defined biological hallmarks.
+Trains Hallmark-specific expert models to capture biological variations (residuals).
 
 **Main Tasks:**
 * **Hallmark Mapping**: Utilizes the orthogonalized dictionary derived from Stage 1 to group CpG sites.
 * **Residual Prediction**: Each expert model is trained to predict the difference (residual) between the chronological age and the Stage 1 global prediction.
 * **Leakage-free CV**: Employs robust Cross-Validation to generate Out-of-Fold (OOF) corrections.
-* **Expert Serialization**: Fits final models on the full dataset and exports them as deployable artifacts.
 
 ```bash
-# Execute Stage 2 Training
+# Execute Stage 2 Training with Parallel Expert Tuning
 heteroage stage2-train \
-  --project-root /path/to/project_root \
-  --output-dir /path/to/output_stage2 \
-  --pc-path /path/to/Global_Healthy_RF_PCs.csv \
-  --stage1-oof /path/to/output_stage1/Stage1_Global_Anchor_OOF.csv \
-  --stage1-dict /path/to/output_stage1/Stage1_Orthogonalized_Hallmark_Dict.json
+  --output-dir ./results/stage2 \
+  --stage1-oof ./results/stage1/stage1_oof_predictions.csv \
+  --stage1-dict ./results/stage1/stage1_orthogonalized_dict.json \
+  --pc-path ./data/RefGuided_PCs.csv \
+  --beta-path ./data/Beta_Train.pkl \
+  --chalm-path ./data/Chalm_Train.pkl \
+  --camda-path ./data/Camda_Train.pkl \
+  --alphas 0.1 0.01 \
+  --n-jobs -1
 ```
 **📂 Key Outputs:**
 
 | File / Directory | Description |
 | :--- | :--- |
-| `Stage2_Expert_OOF_Corrections.csv` | Hallmark-specific residual corrections used as input features for the Stage 3 Meta-Learner. |
-| `Stage2_Expert_Weights.csv` | Detailed coefficients for each hallmark expert model (ElasticNet weights). |
-| `Stage2_Performance_Summary.csv` | Regression metrics (R², MAE) for each hallmark, allowing for domain-specific auditing. |
-| `artifacts/stage2/` | **Deployable Directory**: Contains the hallmark manifest and all serialized expert artifacts. |
+| `Stage2_Hallmark_OOF.csv` | Hallmark-specific residual corrections used as input features for the Stage 3 Meta-Learner. |
+| `stage2_{hallmark}_expert_model.joblib` | Serialized ElasticNet weights for each biological hallmark expert. |
+| `stage2_{hallmark}_features.csv` | Detailed list of CpG features assigned to each specific hallmark expert. |
+| `artifacts/stage2/` | **Deployable Directory**: Contains all serialized expert models and their corresponding feature indices. |
 
 > [!NOTE]
 > Stage 2 is critical for capturing domain-specific aging signals (e.g., inflammation, metabolism, or epigenetic drift) that are often masked in a single-stage global model.
 
 
 ### Stage 3: Context-Aware Fusion
-
-The final stage employs a **LightGBM Meta-Learner** to integrate the global baseline with specific hallmark deviations. By incorporating biological context (Tissue, Sex, and PCs), it produces a refined, "heterogeneity-aware" biological age prediction.
+Final fusion using LightGBM, incorporating tissue and sex context.
 
 **Main Tasks:**
 * **Data Integration**: Merges Stage 1 OOF predictions, Stage 2 expert corrections, and Principal Component (PC) context.
-* **Robust Validation**: Implements leakage-free **GroupKFold** cross-validation based on `project_id`.
-* **Gradient Boosting**: Executes LightGBM training with early stopping to prevent over-fitting.
+* **Robust Validation**: Implements leakage-free **GroupKFold** cross-validation based on `project_id` and `Tissue`.
 * **Interpretability**: Generates feature importance (Gain) to reveal which biological drivers contribute most to the final age.
 * **Meta-Serialization**: Produces the final deployable meta-learner artifacts.
 
 ```bash
 # Execute Stage 3 Training
 heteroage stage3-train \
-  --output-dir /path/to/output_stage3 \
-  --stage1-oof /path/to/output_stage1/Stage1_Global_Anchor_OOF.csv \
-  --stage2-oof /path/to/output_stage2/Stage2_Expert_OOF_Corrections.csv \
-  --pc-path /path/to/Global_Healthy_RF_PCs.csv
+  --output-dir ./results/stage3 \
+  --stage1-oof ./results/stage1/stage1_oof_predictions.csv \
+  --stage2-oof ./results/stage2/Stage2_Hallmark_OOF.csv \
+  --pc-path ./data/RefGuided_PCs.csv \
+  --n-jobs -1
 ```
 **📂 Key Outputs:**
 
 | File / Directory | Description |
 | :--- | :--- |
-| `Stage3_Final_Predictions_OOF.csv` | The final integrated "HeteroAge" predictions for the training cohort (Out-of-Fold). |
-| `Stage3_Attention_Importance.csv` | Ranking of feature contributions (Gain/Split) across all Hallmarks and PC contexts. |
+| `Stage3_Final_Predictions_Train.csv` | The final integrated "HeteroAge" predictions for the training cohort (Out-of-Fold). |
+| `Stage3_Feature_Importance.csv` | Ranking of feature contributions (Gain/Split) across all Hallmarks and PC contexts. |
 | `artifacts/stage3/` | **Deployable Directory**: Contains the serialized LightGBM meta-learner and feature indices. |
 
 > [!TIP]
@@ -250,12 +243,12 @@ The input file (CSV or Parquet) must contain the following schema:
 | :--- | :--- | :--- |
 | **Metadata** | `sample_id`, `Tissue`, `Sex` | Essential biological and administrative context. |
 | **Context** | `RF_PC*` (e.g., `RF_PC1`, `RF_PC2`) | Principal Components used for tissue-specific adjustment. |
-| **Features** | `{cpg_id}_beta`, `{cpg_id}_chalm` | CpG features suffixed by modality as per trained artifacts. |
+| **Features** | `{cpg_id}_beta`, `{cpg_id}_chalm`,  `{cpg_id}_camda` | CpG features suffixed by modality as per trained artifacts. |
 
 **Run Prediction:**
 ```bash
 heteroage pipeline-predict \
-  --artifact-dir /path/to/full_artifacts \
+  --artifact-dir ./deploy_model \
   --input /path/to/master.parquet \
   --out /path/to/final_predictions.csv
 ```
@@ -268,18 +261,18 @@ For modular analysis, debugging, or research into specific biological hallmarks,
 Generates the baseline biological age based on global population trends.
 ```bash
 heteroage stage1-predict \
-  --artifact-dir /path/to/full_artifacts/stage1 \
+  --artifact-dir ./deploy_model/stage1 \
   --input /path/to/master.parquet \
   --out /path/to/stage1_predictions.csv
 ```
 
 #### Stage 2: Hallmark Experts Prediction
-Calculates independent biological deviations (residuals) for each specific Hallmark (e.g., Inflammation, Metabolism, Epigenetic Drift).
+Calculates independent biological deviations (residuals) for each specific Hallmark.
 
 ```bash
 # Generate hallmark-specific residuals
 heteroage stage2-predict \
-  --artifact-dir /path/to/full_artifacts/stage2 \
+  --artifact-dir ./deploy_model/stage2 \
   --input /path/to/master.parquet \
   --out /path/to/stage2_corrections.csv
 ```
@@ -288,12 +281,12 @@ heteroage stage2-predict \
 Fuses the baseline global trends and hallmark-specific corrections with biological context (Tissue, Sex, PCs) to produce the final "HeteroAge" prediction.
 
 > [!IMPORTANT]
-> **Data Dependency**: Stage 3 requires an input table that has already been enriched with Stage 2 outputs. Ensure your input file contains columns suffixed with `_Correction` (e.g., `Inflammation_Correction`) along with the required Principal Components.
+> **Data Dependency**: Stage 3 requires an input table that has already been enriched with Stage 2 outputs. Ensure your input file contains columns starting with `pred_residual_` (e.g., `pred_residual_Inflammation`) as generated by Stage 2.
 
 ```bash
 # Generate final fused biological age
 heteroage stage3-predict \
-  --artifact-dir /path/to/full_artifacts/stage3 \
+  --artifact-dir ./deploy_model/stage3 \
   --input /path/to/merged_stage1_stage2.parquet \
   --out /path/to/stage3_predictions.csv
 ```
@@ -329,10 +322,10 @@ heteroage-clock/
 
 | Feature | Implementation Detail |
 | :--- | :--- |
-| **Leakage-Free Evaluation** | All CV splits are strictly **grouped by `project_id`** and **stratified by `Tissue`**, preventing over-fitting and ensuring cross-study generalizability. |
-| **Deterministic Inference** | Every stage serializes its entire environment—including **Imputers, Scalers, Selected Column Indices**, and model weights—to ensure bit-identical results across different environments. |
-| **Robust Data Handling** | Automated handling of missing values: all-NaN columns are zero-filled to maintain matrix dimensions, while partial NaNs are imputed via median values. |
-| **Deployment-Ready** | Decoupled architecture allows Stage 3 to run using only serialized artifacts, eliminating the need for retraining or access to the original training cohort. |
+| **High-Performance Parallelism** | Leverages `joblib` for multi-core hyperparameter grid searching and LightGBM multi-threading, significantly reducing training time. |
+| **Flexible Hyperparameter Search** | Supports both automated range generation and explicit user-defined lists for `alphas` and `l1-ratios` via CLI. |
+| **Leakage-Free Evaluation** | All CV splits are strictly grouped by `project_id` and stratified by `Tissue`, preventing over-fitting and ensuring cross-study generalizability. |
+| **Deterministic Inference** | Every stage serializes its entire environment—including **Imputers, Age Transformers, Selected Column Indices**, and model weights—to ensure bit-identical results. |
 
 ---
 
@@ -341,8 +334,8 @@ heteroage-clock/
 ### ⚠️ High Memory Usage
 Processing large-scale DNA methylation matrices can be resource-intensive. 
 * **Use Parquet**: Convert large CSV/PKL files to Parquet format for faster I/O and lower memory overhead.
+* **Manage Parallelism**: When training on very large datasets, high `--n-jobs` values may lead to memory exhaustion (OOM). Adjust according to available RAM.
 * **Feature Subsetting**: Only load the CpG sites defined in your `Feature_Dict` or trained artifacts.
-* **Chunking**: If memory is limited, build master tables in chunks rather than loading the entire beta matrix at once.
 
 ### ⚠️ Missing Correction Columns
 Stage 3 requires inputs from Stage 2. 
