@@ -2,7 +2,7 @@
 heteroage_clock.pipeline
 
 High-level orchestration for training and inference.
-Updates: Now accepts explicit file paths and hyperparameters to support the generic CLI.
+Updates: Now accepts explicit file paths and hyperparameters (lists and n_jobs) to support the generic CLI.
 """
 
 import os
@@ -22,11 +22,12 @@ from heteroage_clock.stages.stage3 import train_stage3 as _train_stage3, predict
 def train_stage1(
     output_dir, pc_path, dict_path, beta_path, chalm_path, camda_path, 
     sweep_file=None, alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, 
-    l1_ratio=0.5, n_splits=5, seed=42, max_iter=2000, project_root=None
+    l1_ratio=0.5, alphas=None, l1_ratios=None, n_splits=5, seed=42, 
+    max_iter=2000, n_jobs=-1, project_root=None
 ):
     """
     Wrapper for Stage 1 Training: Global Anchor.
-    Now forwards all paths and hyperparameters.
+    Now forwards all paths, hyperparameter lists, and n_jobs for parallel grid search.
     """
     log("=== Pipeline: Starting Stage 1 Training (Global Anchor) ===")
     _train_stage1(
@@ -41,9 +42,12 @@ def train_stage1(
         alpha_end=alpha_end,
         n_alphas=n_alphas,
         l1_ratio=l1_ratio,
+        alphas=alphas,
+        l1_ratios=l1_ratios,
         n_splits=n_splits,
         seed=seed,
-        max_iter=max_iter
+        max_iter=max_iter,
+        n_jobs=n_jobs
     )
     log("=== Pipeline: Stage 1 Training Completed ===\n")
 
@@ -51,10 +55,12 @@ def train_stage1(
 def train_stage2(
     output_dir, stage1_oof, stage1_dict, pc_path, beta_path, chalm_path, camda_path,
     alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, l1_ratio=0.5, 
-    n_splits=5, seed=42, max_iter=2000, project_root=None
+    alphas=None, l1_ratios=None, n_splits=5, seed=42, max_iter=2000, 
+    n_jobs=-1, project_root=None
 ):
     """
     Wrapper for Stage 2 Training: Hallmark Experts.
+    Now forwards all paths, hyperparameter lists, and n_jobs for parallel tuning.
     """
     log("=== Pipeline: Starting Stage 2 Training (Hallmark Experts) ===")
     _train_stage2(
@@ -69,9 +75,12 @@ def train_stage2(
         alpha_end=alpha_end,
         n_alphas=n_alphas,
         l1_ratio=l1_ratio,
+        alphas=alphas,
+        l1_ratios=l1_ratios,
         n_splits=n_splits,
         seed=seed,
-        max_iter=max_iter
+        max_iter=max_iter,
+        n_jobs=n_jobs
     )
     log("=== Pipeline: Stage 2 Training Completed ===\n")
 
@@ -79,10 +88,11 @@ def train_stage2(
 def train_stage3(
     output_dir, stage1_oof, stage2_oof, pc_path,
     n_estimators=2000, learning_rate=0.01, num_leaves=31, 
-    max_depth=-1, n_splits=5, seed=42, project_root=None
+    max_depth=-1, n_splits=5, seed=42, n_jobs=-1, project_root=None
 ):
     """
     Wrapper for Stage 3 Training: Context-Aware Fusion.
+    Now forwards path and parallel processing parameters.
     """
     log("=== Pipeline: Starting Stage 3 Training (Context-Aware Fusion) ===")
     _train_stage3(
@@ -95,7 +105,8 @@ def train_stage3(
         num_leaves=num_leaves,
         max_depth=max_depth,
         n_splits=n_splits,
-        seed=seed
+        seed=seed,
+        n_jobs=n_jobs
     )
     log("=== Pipeline: Stage 3 Training Completed ===\n")
 
@@ -105,14 +116,23 @@ def train_stage3(
 # ==============================================================================
 
 def predict_stage1(artifact_dir, input_path, output_path):
+    """
+    Wrapper for Stage 1 Prediction.
+    """
     log("--- Pipeline: Running Stage 1 Inference ---")
     _predict_stage1(artifact_dir, input_path, output_path)
 
 def predict_stage2(artifact_dir, input_path, output_path):
+    """
+    Wrapper for Stage 2 Prediction.
+    """
     log("--- Pipeline: Running Stage 2 Inference ---")
     _predict_stage2(artifact_dir, input_path, output_path)
 
 def predict_stage3(artifact_dir, input_path, output_path):
+    """
+    Wrapper for Stage 3 Prediction.
+    """
     log("--- Pipeline: Running Stage 3 Inference ---")
     _predict_stage3(artifact_dir, input_path, output_path)
 
@@ -166,7 +186,7 @@ def predict_pipeline(artifact_dir, input_path, output_path):
     s3_artifacts = os.path.join(artifact_dir, "stage3")
     predict_stage3(s3_artifacts, merged_input_s3, output_path)
     
-    # Cleanup (Optional)
+    # Cleanup intermediate files
     if os.path.exists(s1_out): os.remove(s1_out)
     if os.path.exists(s2_out): os.remove(s2_out)
     if os.path.exists(merged_input_s3): os.remove(merged_input_s3)

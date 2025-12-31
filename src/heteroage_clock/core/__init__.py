@@ -6,8 +6,9 @@ Core mathematical and statistical components of the clock.
 
 from .age_transform import AgeTransformer
 from .metrics import compute_regression_metrics, heteroage_score, RegressionMetrics
-# [FIX] Import from splits.py (the source of truth), not sampling.py
 from .splits import make_stratified_group_folds 
+# [KEEP] Ensure optimization is available if users want to call it directly
+from .optimization import tune_elasticnet_macro_micro
 
 __all__ = [
     "AgeTransformer",
@@ -15,4 +16,5 @@ __all__ = [
     "heteroage_score",
     "RegressionMetrics",
     "make_stratified_group_folds",
+    "tune_elasticnet_macro_micro",
 ]

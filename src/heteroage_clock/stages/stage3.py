@@ -26,11 +26,14 @@ def train_stage3(
     num_leaves: int = 31,
     max_depth: int = -1,
     n_splits: int = 5,
-    seed: int = 42
+    seed: int = 42,
+    # Added parallel processing support
+    n_jobs: int = -1
 ) -> None:
     """
     Train Stage 3 Meta-Learner.
     Accepts explicit paths and hyperparameters.
+    Now supports parallel processing via n_jobs.
     """
     artifact_handler = Stage3Artifact(output_dir)
     
@@ -88,14 +91,14 @@ def train_stage3(
 
     oof_preds_linear = np.zeros(len(y))
     
-    # Construct LightGBM params from arguments
+    # Construct LightGBM params from arguments, including n_jobs
     model_params = {
         'random_state': seed,
         'n_estimators': n_estimators,
         'learning_rate': learning_rate,
         'num_leaves': num_leaves,
         'max_depth': max_depth,
-        'n_jobs': -1,
+        'n_jobs': n_jobs,
         'verbose': -1
     }
     

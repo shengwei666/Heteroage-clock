@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from sklearn.base import clone
 from collections import defaultdict
+from typing import List, Optional
 
 from heteroage_clock.core.metrics import compute_regression_metrics
 from heteroage_clock.data.assemble import assemble_features, filter_and_impute
@@ -27,11 +28,14 @@ def train_stage1(
     chalm_path: str,
     camda_path: str,
     sweep_file: str = None,
-    # Hyperparameters
+    # Hyperparameters updated to support lists and parallel
     alpha_start: float = -4.0,
     alpha_end: float = -0.5,
     n_alphas: int = 30,
     l1_ratio: float = 0.5,
+    alphas: Optional[List[float]] = None,
+    l1_ratios: Optional[List[float]] = None,
+    n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
     max_iter: int = 2000
@@ -39,6 +43,7 @@ def train_stage1(
     """
     Train the Stage 1 model.
     Accepts explicit file paths and all hyperparameters.
+    Now supports parallel processing and hyperparameter lists.
     """
     artifact_handler = Stage1Artifact(output_dir)
     
@@ -85,6 +90,7 @@ def train_stage1(
 
     # --- 5. Optimization (Macro + Micro) ---
     log("Optimizing Hyperparameters (Macro + Micro) on Full Set...")
+    # Updated to pass through new list and parallel parameters
     best_model = tune_elasticnet_macro_micro(
         X=X_selected, 
         y=y_trans, 
@@ -95,6 +101,9 @@ def train_stage1(
         alpha_end=alpha_end,
         n_alphas=n_alphas,
         l1_ratio=l1_ratio,
+        alphas=alphas,
+        l1_ratios=l1_ratios,
+        n_jobs=n_jobs,
         n_splits=n_splits,
         seed=seed,
         max_iter=max_iter

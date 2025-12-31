@@ -3,12 +3,13 @@ heteroage_clock.cli
 
 Command Line Interface.
 Exposes all file paths and hyperparameters as arguments.
+Updates: Added support for n_jobs and hyperparameter lists for parallel search.
 """
 
 import argparse
 import sys
 import os
-# [CHANGE] Import from pipeline to maintain architecture
+# Import from pipeline to maintain architecture
 from heteroage_clock.pipeline import (
     train_stage1, train_stage2, train_stage3, 
     predict_pipeline, predict_stage1, predict_stage2, predict_stage3
@@ -39,7 +40,12 @@ def main():
     p_s1.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
     p_s1.add_argument("--sweep-file", type=str, help="Optional sweep file")
     
-    # Hyperparameters
+    # Hyperparameters (Enhanced for List and Parallel)
+    p_s1.add_argument("--alphas", type=float, nargs='+', help="List of alpha values to search")
+    p_s1.add_argument("--l1-ratios", type=float, nargs='+', help="List of L1 ratio values to search")
+    p_s1.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel jobs for grid search")
+    
+    # Existing Hyperparameters
     p_s1.add_argument("--alpha-start", type=float, default=-4.0, help="Log10 start of alpha range")
     p_s1.add_argument("--alpha-end", type=float, default=-0.5, help="Log10 end of alpha range")
     p_s1.add_argument("--n-alphas", type=int, default=30, help="Number of alphas")
@@ -61,7 +67,12 @@ def main():
     p_s2.add_argument("--chalm-path", type=str, help="Path to Chalm Value Pickle")
     p_s2.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
     
-    # Hyperparameters (Same as Stage 1)
+    # Hyperparameters (Enhanced)
+    p_s2.add_argument("--alphas", type=float, nargs='+', help="List of alpha values")
+    p_s2.add_argument("--l1-ratios", type=float, nargs='+', help="List of L1 ratios")
+    p_s2.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel jobs")
+    
+    # Existing Hyperparameters
     p_s2.add_argument("--alpha-start", type=float, default=-4.0)
     p_s2.add_argument("--alpha-end", type=float, default=-0.5)
     p_s2.add_argument("--n-alphas", type=int, default=30)
@@ -80,7 +91,10 @@ def main():
     p_s3.add_argument("--stage2-oof", type=str, help="Path to Stage 2 OOF CSV")
     p_s3.add_argument("--pc-path", type=str, help="Path to PC covariates")
     
-    # Hyperparameters (LightGBM)
+    # Hyperparameters (Enhanced for Parallel)
+    p_s3.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel threads for LightGBM")
+    
+    # Existing Hyperparameters
     p_s3.add_argument("--n-estimators", type=int, default=2000)
     p_s3.add_argument("--learning-rate", type=float, default=0.01)
     p_s3.add_argument("--num-leaves", type=int, default=31)
@@ -88,13 +102,12 @@ def main():
     p_s3.add_argument("--n-splits", type=int, default=5)
     p_s3.add_argument("--seed", type=int, default=42)
 
-    # --- Inference ---
+    # --- Inference Commands ---
     p_pipe = subparsers.add_parser("pipeline-predict", help="Full Pipeline Inference")
     p_pipe.add_argument("--artifact-dir", required=True)
     p_pipe.add_argument("--input", required=True)
     p_pipe.add_argument("--out", required=True)
 
-    # Stage 1-3 Predict (Optional shortcuts)
     p_p1 = subparsers.add_parser("stage1-predict", help="Stage 1 Inference")
     p_p1.add_argument("--artifact-dir", required=True)
     p_p1.add_argument("--input", required=True)
@@ -131,6 +144,9 @@ def main():
             chalm_path=chalm,
             camda_path=camda,
             sweep_file=args.sweep_file,
+            alphas=args.alphas,
+            l1_ratios=args.l1_ratios,
+            n_jobs=args.n_jobs,
             alpha_start=args.alpha_start,
             alpha_end=args.alpha_end,
             n_alphas=args.n_alphas,
@@ -161,6 +177,9 @@ def main():
             beta_path=beta,
             chalm_path=chalm,
             camda_path=camda,
+            alphas=args.alphas,
+            l1_ratios=args.l1_ratios,
+            n_jobs=args.n_jobs,
             alpha_start=args.alpha_start,
             alpha_end=args.alpha_end,
             n_alphas=args.n_alphas,
@@ -185,6 +204,7 @@ def main():
             stage1_oof=s1_oof,
             stage2_oof=s2_oof,
             pc_path=pc,
+            n_jobs=args.n_jobs,
             n_estimators=args.n_estimators,
             learning_rate=args.learning_rate,
             num_leaves=args.num_leaves,

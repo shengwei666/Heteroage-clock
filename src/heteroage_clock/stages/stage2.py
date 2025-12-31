@@ -9,6 +9,7 @@ import glob
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
+from typing import List, Optional
 
 from heteroage_clock.core.metrics import compute_regression_metrics
 from heteroage_clock.data.assemble import assemble_features
@@ -25,11 +26,14 @@ def train_stage2(
     beta_path: str,
     chalm_path: str,
     camda_path: str,
-    # Hyperparameters
+    # Hyperparameters updated to support lists and parallel
     alpha_start: float = -4.0,
     alpha_end: float = -0.5,
     n_alphas: int = 30,
     l1_ratio: float = 0.5,
+    alphas: Optional[List[float]] = None,
+    l1_ratios: Optional[List[float]] = None,
+    n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
     max_iter: int = 2000
@@ -37,6 +41,7 @@ def train_stage2(
     """
     Train Stage 2 Expert Models.
     Accepts explicit paths and hyperparameters.
+    Now supports parallel processing and hyperparameter lists.
     """
     artifact_handler = Stage2Artifact(output_dir)
     
@@ -103,6 +108,7 @@ def train_stage2(
             
         X = train_df[relevant_cols].values
         
+        # Optimization updated with list and n_jobs support
         best_model = tune_elasticnet_macro_micro(
             X=X, 
             y=y_global, 
@@ -113,6 +119,9 @@ def train_stage2(
             alpha_end=alpha_end,
             n_alphas=n_alphas,
             l1_ratio=l1_ratio,
+            alphas=alphas,
+            l1_ratios=l1_ratios,
+            n_jobs=n_jobs,
             n_splits=n_splits,
             seed=seed,
             max_iter=max_iter
@@ -172,6 +181,7 @@ def predict_stage2(artifact_dir: str, input_path: str, output_path: str) -> None
         
         X = data[feature_cols].values
         preds = model.predict(X)
+        
         output_df[f"pred_residual_{hallmark_name}"] = preds
         
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

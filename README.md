@@ -123,7 +123,7 @@ The Global Anchor establishes the baseline biological age.
 * **Artifact Generation**: Saves the global model, the stable hallmark dictionary, and Out-of-Fold (OOF) residuals.
 
 ```bash
-# Execute Stage 1 Training
+# Execute Stage 1 Training with Parallel Grid Search
 heteroage stage1-train \
   --output-dir ./results/stage1 \
   --pc-path ./data/RefGuided_PCs.csv \
@@ -131,8 +131,9 @@ heteroage stage1-train \
   --beta-path ./data/Beta_Train.pkl \
   --chalm-path ./data/Chalm_Train.pkl \
   --camda-path ./data/Camda_Train.pkl \
-  --l1-ratio 0.5 \
-  --n-alphas 30
+  --alphas 0.1 0.01 0.001 \
+  --l1-ratios 0.5 0.7 0.9 \
+  --n-jobs -1
 ```
 **📂 Key Outputs:**
 
