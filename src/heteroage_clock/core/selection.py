@@ -16,22 +16,35 @@ def fast_correlation(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     Calculate Pearson correlation coefficient between each column of X and y.
     Vectorized implementation for high performance.
+    
+    Args:
+        X: (n_samples, n_features)
+        y: (n_samples,)
+    
+    Returns:
+        Array of correlations (n_features,)
     """
     n = X.shape[0]
     if n < 2:
         return np.zeros(X.shape[1])
 
+    # Center inputs
     X_mean = X.mean(axis=0)
     y_mean = y.mean()
     X_centered = X - X_mean
     y_centered = y - y_mean
     
+    # Standard deviation
     X_std = X.std(axis=0)
     y_std = y.std()
     
     # Avoid division by zero
     with np.errstate(divide='ignore', invalid='ignore'):
-        corrs = np.dot(X_centered.T, y_centered) / (n * X_std * y_std + 1e-12)
+        # Covariance * n / (n * std_x * std_y) -> Covariance / (std_x * std_y)
+        # Note: np.dot(u, v) is sum(u_i * v_i), which is numerator of Pearson
+        numerator = np.dot(X_centered.T, y_centered)
+        denominator = n * X_std * y_std + 1e-12
+        corrs = numerator / denominator
     
     return np.nan_to_num(corrs, nan=0.0)
 
@@ -52,6 +65,10 @@ def orthogonalize_by_correlation(
        
     This provides a STABLE definition of Hallmarks.
     """
+    # Sanity check
+    if X.shape[1] != len(feature_names):
+        raise ValueError(f"Feature count mismatch: X has {X.shape[1]}, names has {len(feature_names)}")
+
     log("  > Calculating global correlations for ranking...")
     
     # 1. Global Correlation Calculation
@@ -88,13 +105,13 @@ def orthogonalize_by_correlation(
             best_h = possibilities[0][0]
         else:
             # Conflict: Choose the hallmark where this feature ranks highest (smallest rank index)
-            # Tie-breaker: sort by hallmark name to be deterministic
+            # Tie-breaker: sort by hallmark name (x[0]) to be deterministic if ranks are equal
             best_h = min(possibilities, key=lambda x: (x[1], x[0]))[0]
             
         final_ortho_dict[best_h].append(f)
         
     return dict(final_ortho_dict)
 
-# Compatibility stub
+# Compatibility stub (Optional, keeps old scripts from breaking)
 def select_features_internal(*args, **kwargs):
     raise NotImplementedError("Use orthogonalize_by_correlation instead.")

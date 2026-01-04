@@ -18,28 +18,22 @@ def assemble_features(
 ) -> pd.DataFrame:
     """
     Assembles various modalities and covariates into a single feature dataframe.
+    [Fixed]: Robustly handles metadata duplication to prevent 'project_id_x' errors.
     """
-    # 1. Prepare Metadata
+    # 1. Prepare Metadata (Base DataFrame)
+    # We use the provided metadata df (usually cpg_beta) as the anchor.
     meta_candidates = ['sample_id', 'age', 'Age', 'sex', 'Sex', 'tissue', 'Tissue', 'project_id', 'is_healthy', 'Is_Healthy']
     
-    # Ensure sample_id is a column in metadata
-    df_meta = metadata.copy()
-    if 'sample_id' not in df_meta.columns:
-        df_meta.index.name = 'sample_id'
-        df_meta = df_meta.reset_index()
+    df_base = metadata.copy()
+    if 'sample_id' not in df_base.columns:
+        if df_base.index.name == 'sample_id':
+            df_base = df_base.reset_index()
+        else:
+            raise ValueError("Metadata dataframe missing 'sample_id' column or index.")
     
-    # Filter to keep only metadata columns
-    cols_to_keep = [c for c in df_meta.columns if c in meta_candidates or c.lower() in [m.lower() for m in meta_candidates]]
-    if 'sample_id' not in cols_to_keep:
-        cols_to_keep.append('sample_id')
-        
-    df_base = df_meta[cols_to_keep].copy()
-    
-    # Standardize 'age' column name
-    if 'Age' in df_base.columns and 'age' not in df_base.columns:
-        df_base.rename(columns={'Age': 'age'}, inplace=True)
-
     # 2. Define modalities to merge
+    # Note: We skip 'beta' if it is the same object as metadata to save time/memory,
+    # but if they are different, we process it.
     modalities = [
         ('beta', cpg_beta),
         ('chalm', chalm_data),
@@ -50,17 +44,39 @@ def assemble_features(
     log(f"Assembling features for {len(df_base)} samples...")
 
     for name, df_mod in modalities:
-        if df_mod is None:
+        if df_mod is None or df_mod.empty:
             continue
             
+        # Optimization: If this modality IS the metadata object, we don't need to merge it again
+        # provided we already took all columns. But to be safe, we usually merge.
+        # If it's the exact same object, merging inner on sample_id is redundant but harmless 
+        # IF we handle columns correctly.
+        if df_mod is metadata:
+             # If we initialized df_base FROM metadata, we already have these features.
+             # We can skip merging metadata with itself.
+             continue
+
         df_m = df_mod.copy()
         if 'sample_id' not in df_m.columns:
-            df_m.index.name = 'sample_id'
-            df_m = df_m.reset_index()
+            if df_m.index.name == 'sample_id':
+                df_m = df_m.reset_index()
+            else:
+                log(f"Warning: Modality {name} missing sample_id. Skipping.")
+                continue
             
-        # Avoid duplicating metadata columns
-        if df_mod is metadata:
-            cols_overlap = [c for c in df_m.columns if c in df_base.columns and c != 'sample_id']
+        # --- [CRITICAL FIX] Robust Column Deduplication ---
+        # Before merging, check for ANY columns that already exist in df_base.
+        # We MUST drop them from df_m to prevent suffix creation (_x, _y).
+        # We only keep 'sample_id' for the merge key.
+        
+        existing_cols = set(df_base.columns)
+        new_cols = set(df_m.columns)
+        
+        # Calculate intersection excluding merge key
+        cols_overlap = list(existing_cols.intersection(new_cols) - {'sample_id'})
+        
+        if cols_overlap:
+            # log(f"  > {name}: Dropping {len(cols_overlap)} duplicate columns (e.g., {cols_overlap[:3]}...)")
             df_m = df_m.drop(columns=cols_overlap)
 
         # Merge (Inner Join)
@@ -70,6 +86,10 @@ def assemble_features(
         
         if after_len < before_len:
             log(f"  > Merging {name}: dropped {before_len - after_len} samples (common: {after_len})")
+
+    # Final cleanup: Standardize 'age' column name if needed
+    if 'Age' in df_base.columns and 'age' not in df_base.columns:
+        df_base.rename(columns={'Age': 'age'}, inplace=True)
 
     return df_base
 

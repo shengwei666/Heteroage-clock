@@ -95,8 +95,13 @@ def tune_elasticnet_macro_micro(
     groups: Any, 
     tissues: Any, 
     trans_func: Optional[Any] = None, 
+    # Alpha generation params (Updated to match Stage 1 inputs)
     alphas: Optional[List[float]] = None,
+    alpha_start: float = -4.0,
+    alpha_end: float = -0.5,
+    n_alphas: int = 30,
     l1_ratios: Optional[List[float]] = None,
+    l1_ratio: float = 0.5, # Fallback scalar if list is None
     n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
@@ -111,16 +116,20 @@ def tune_elasticnet_macro_micro(
     Grid search for best ElasticNet alpha that maximizes (Micro_R + Macro_R).
     Supports list inputs, parallel execution, and intelligent down-sampling.
     """
+    # 1. Generate Alphas if not provided
     if alphas is None:
-        alphas = np.logspace(-4, -0.5, 30).tolist()
+        alphas = np.logspace(alpha_start, alpha_end, n_alphas).tolist()
+    
+    # 2. Handle L1 Ratios
     if l1_ratios is None:
-        l1_ratios = [0.5]
+        l1_ratios = [l1_ratio]
     
     folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
     
     if not folds:
         log("Warning: Split failed in optimization. Returning default model.")
-        return ElasticNet(alpha=0.01, l1_ratio=l1_ratios[0], random_state=seed)
+        # Return a safe default
+        return ElasticNet(alpha=alphas[0] if alphas else 0.01, l1_ratio=l1_ratios[0], random_state=seed)
 
     # Bundle sampling parameters
     sampling_params = {
@@ -142,7 +151,6 @@ def tune_elasticnet_macro_micro(
     search_max_iter = max(1000, max_iter // 2)
 
     # Parallel grid search
-    # We pass groups, tissues, and sampling_params to _evaluate_config
     results = Parallel(n_jobs=n_jobs)(
         delayed(_evaluate_config)(
             a, l, X, y, groups, tissues, folds, trans_func, seed, search_max_iter, sampling_params

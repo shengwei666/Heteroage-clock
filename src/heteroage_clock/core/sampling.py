@@ -1,53 +1,52 @@
 """
 heteroage_clock.core.sampling
 
-Industrial-grade utilities for sampling and stratified splitting, ensuring leakage-free and heterogeneity-aware splits.
-
-Design goals:
-- Stratified sampling based on project and tissue type to prevent leakage.
-- Robust handling of different group sizes and sample imbalance.
-- Efficient data handling with compatibility across stages.
-
-This file contains functions for:
-- Stratified K-Fold splitting by project and tissue group (avoid leakage).
-- Adaptive sampling for balancing data based on sample size constraints (min/max).
+Industrial-grade utilities for sampling and stratified splitting.
+Updates: Added robustness for missing 'project_id' and optimized sampling logic.
 """
 
 from typing import List, Tuple, Any
 import pandas as pd
 import numpy as np
 from collections import defaultdict
-from sklearn.model_selection import StratifiedKFold
-
 
 def make_stratified_group_folds(groups: pd.Series, tissues: pd.Series, n_splits: int, seed: int) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
-    Create stratified group folds ensuring no leakage. Samples are grouped by `groups` (e.g., project) and stratified by `tissues`.
+    Create stratified group folds ensuring no leakage. 
+    Samples are grouped by `groups` (e.g., project) and stratified by `tissues`.
 
     Args:
-        groups (pd.Series): Group labels (e.g., project_id) to ensure leakage-free splits.
-        tissues (pd.Series): Tissue types for stratified splitting.
-        n_splits (int): Number of folds for the stratified splitting.
-        seed (int): Random seed for reproducibility.
+        groups (pd.Series): Group labels (e.g., project_id).
+        tissues (pd.Series): Tissue types.
+        n_splits (int): Number of folds.
+        seed (int): Random seed.
 
     Returns:
-        List of tuples: Each tuple contains two arrays (train indices, validation indices).
+        List of (train_idx, val_idx) tuples.
     """
-    df_meta = pd.DataFrame({'group': groups, 'tissue': tissues})
+    # Ensure inputs are pandas Series for consistent handling
+    if not isinstance(groups, pd.Series):
+        groups = pd.Series(groups)
+    if not isinstance(tissues, pd.Series):
+        tissues = pd.Series(tissues)
+
+    df_meta = pd.DataFrame({'group': groups.values, 'tissue': tissues.values})
     
     if df_meta.empty:
         return []
     
     # Get the most common tissue per project for stratified sampling
-    project_map = df_meta.groupby('group')['tissue'].agg(lambda x: x.mode()[0]).reset_index()
-    tissue_to_projs = defaultdict(list)
+    # Fallback: if a group has multiple tissues, take the mode
+    project_map = df_meta.groupby('group')['tissue'].agg(lambda x: x.mode()[0] if not x.mode().empty else x.iloc[0]).reset_index()
     
+    tissue_to_projs = defaultdict(list)
     for _, row in project_map.iterrows():
         tissue_to_projs[row['tissue']].append(row['group'])
     
     folds = [[] for _ in range(n_splits)]
     rng = np.random.RandomState(seed)
     
+    # Sort keys for deterministic behavior before shuffling
     for t_type in sorted(tissue_to_projs.keys()):
         projs = tissue_to_projs[t_type]
         rng.shuffle(projs)
@@ -58,8 +57,10 @@ def make_stratified_group_folds(groups: pd.Series, tissues: pd.Series, n_splits:
     cv_indices = []
     
     for i in range(n_splits):
-        val_projects = folds[i]
-        is_val = np.isin(groups, val_projects)
+        val_projects = set(folds[i]) # Use set for faster lookup
+        # Boolean mask for validation
+        is_val = df_meta['group'].isin(val_projects).values
+        
         train_idx = all_idx[~is_val]
         val_idx = all_idx[is_val]
         cv_indices.append((train_idx, val_idx))
@@ -69,43 +70,72 @@ def make_stratified_group_folds(groups: pd.Series, tissues: pd.Series, n_splits:
 
 def adaptive_sampler(df: pd.DataFrame, min_coh: int, min_c: int, max_c: int, mult: float, seed: int) -> Tuple[pd.DataFrame, int]:
     """
-    Adaptive sampler to balance samples across different tissue groups with size constraints. 
-    Ensures each tissue group in the dataframe has a minimum sample size (min_coh), 
-    and adjusts the sample size per tissue based on the specified multiplier.
+    Adaptive sampler to balance samples across different tissue groups.
+    Down-samples majority classes (like Blood) to `max_c` while keeping minority classes.
 
     Args:
-        df (pd.DataFrame): The data to sample from.
-        min_coh (int): Minimum number of cohorts per tissue.
-        min_c (int): Minimum number of samples per tissue.
-        max_c (int): Maximum number of samples per tissue.
-        mult (float): Multiplier to scale the number of samples per tissue.
-        seed (int): Random seed for reproducibility.
+        df (pd.DataFrame): Data containing 'Tissue' and optionally 'project_id'.
+        min_coh (int): Min cohorts to keep a tissue.
+        min_c (int): Min samples per tissue (soft floor).
+        max_c (int): Max samples per tissue (hard cap).
+        mult (float): Multiplier for median calculation.
+        seed (int): Random seed.
 
     Returns:
-        Tuple: A DataFrame containing the sampled data and the number of samples selected.
+        Tuple[pd.DataFrame, int]: Sampled DataFrame and the calculated target_n.
     """
     if df.empty:
         return df, 0
     
-    cohort_stats = df.groupby('Tissue')['project_id'].nunique()
-    valid_tissues = cohort_stats[cohort_stats >= min_coh].index
+    # 1. Filter by Minimum Cohorts (if project_id exists)
+    if 'project_id' in df.columns:
+        cohort_stats = df.groupby('Tissue')['project_id'].nunique()
+        valid_tissues = cohort_stats[cohort_stats >= min_coh].index
+    else:
+        # If no project_id, we cannot filter by cohort count, so keep all tissues
+        valid_tissues = df['Tissue'].unique()
     
     if len(valid_tissues) == 0:
         return df.iloc[:0], 0
     
     df_f = df[df['Tissue'].isin(valid_tissues)].copy()
-    median_n = df_f['Tissue'].value_counts().median()
-    if pd.isna(median_n):
+    
+    # 2. Calculate Target N
+    # Logic: Median * Multiplier, but clamped between [min_c, max_c]
+    counts = df_f['Tissue'].value_counts()
+    median_n = counts.median()
+    if pd.isna(median_n): 
         median_n = 0
     
-    target_n = int(np.clip(median_n * mult, min_c, max_c))
+    # Calculate target based on median
+    raw_target = median_n * mult
+    target_n = int(np.clip(raw_target, min_c, max_c))
     
+    # Safety: Strictly enforce max_c as the ceiling
+    if target_n > max_c:
+        target_n = max_c
+        
     rng = np.random.RandomState(seed)
     selected_indices = []
     
+    # 3. Perform Sampling
     for t in valid_tissues:
-        t_idx = df_f[df_f['Tissue'] == t].index
-        selected = rng.choice(t_idx, size=min(len(t_idx), target_n), replace=False)
-        selected_indices.extend(selected.tolist())
+        # Get indices for this tissue in the filtered dataframe
+        t_indices = df_f[df_f['Tissue'] == t].index.tolist()
+        n_available = len(t_indices)
+        
+        # Determine how many to keep for this specific tissue
+        # If n_available (15000) > target_n (500) -> Keep 500
+        # If n_available (120) < target_n (500) -> Keep 120
+        n_keep = min(n_available, target_n)
+        
+        # If we have more than we need, sample randomly
+        if n_available > n_keep:
+            selected = rng.choice(t_indices, size=n_keep, replace=False)
+            selected_indices.extend(selected)
+        else:
+            # Keep all if we don't have enough to hit the cap
+            selected_indices.extend(t_indices)
     
+    # Return sampled dataframe and the target used
     return df_f.loc[selected_indices].reset_index(drop=True), target_n
