@@ -102,7 +102,8 @@ def train_stage1(
     # --- 5. Optimization (Macro + Micro) ---
     log("Optimizing Hyperparameters (Macro + Micro) with Intelligent Sampling...")
     # Updated to pass through new list, parallel, and sampling parameters
-    best_model = tune_elasticnet_macro_micro(
+    # [CHANGE]: Unpack best_model and sweep_df
+    best_model, sweep_df = tune_elasticnet_macro_micro(
         X=X_selected, 
         y=y_trans, 
         groups=groups, 
@@ -124,6 +125,10 @@ def train_stage1(
         max_cap=max_cap,
         median_mult=median_mult
     )
+
+    # [CHANGE]: Save the detailed sweep report
+    log("Saving Sweep Report...")
+    artifact_handler.save("Stage1_Sweep_Report", sweep_df)
 
     # --- 6. Final OOF Generation (Asymmetric) ---
     log("Generating Final OOF (Asymmetric: Balanced Train, Full Val)...")

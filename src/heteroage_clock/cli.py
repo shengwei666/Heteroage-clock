@@ -54,7 +54,7 @@ def main():
     p_s1.add_argument("--max-iter", type=int, default=2000)
 
     # Intelligent Sampling Params (Stage 1)
-    p_s1.add_argument("--min-cohorts", type=int, default=1)
+    p_s1.add_argument("--min-cohorts", type=int, default=2)
     p_s1.add_argument("--min-cap", type=int, default=30)
     p_s1.add_argument("--max-cap", type=int, default=500)
     p_s1.add_argument("--median-mult", type=float, default=1.0)
@@ -86,7 +86,7 @@ def main():
     p_s2.add_argument("--max-iter", type=int, default=2000)
 
     # Intelligent Sampling Params (Stage 2 - NEW)
-    p_s2.add_argument("--min-cohorts", type=int, default=1)
+    p_s2.add_argument("--min-cohorts", type=int, default=2)
     p_s2.add_argument("--min-cap", type=int, default=30)
     p_s2.add_argument("--max-cap", type=int, default=500)
     p_s2.add_argument("--median-mult", type=float, default=1.0)

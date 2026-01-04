@@ -7,6 +7,7 @@ Updates:
 - Implements 'Intelligent Down-sampling' (Asymmetric OOF) to match Stage 1 fairness.
 - Fixes dictionary loading bug (uses json.load).
 - Accepts **kwargs to handle pipeline arguments.
+- Adapts to new optimization return signature.
 """
 
 import os
@@ -129,7 +130,8 @@ def train_stage2(
         
         # A. Optimization (with Intelligent Sampling)
         # We find the best hyperparameters for this specific hallmark expert
-        best_model = tune_elasticnet_macro_micro(
+        # [UPDATED]: Unpack model, ignore sweep report (_)
+        best_model, _ = tune_elasticnet_macro_micro(
             X=X, 
             y=y_global, 
             groups=groups, 
