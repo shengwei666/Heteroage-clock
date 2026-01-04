@@ -5,6 +5,7 @@ Stage 1: Global Anchor
 """
 
 import os
+import json
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
@@ -19,6 +20,7 @@ from heteroage_clock.core.optimization import tune_elasticnet_macro_micro
 from heteroage_clock.core.selection import orthogonalize_by_correlation
 from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage1 import Stage1Artifact
+from heteroage_clock.core.sampling import adaptive_sampler
 
 def train_stage1(
     output_dir: str, 
@@ -38,12 +40,18 @@ def train_stage1(
     n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
-    max_iter: int = 2000
+    max_iter: int = 2000,
+    # New Intelligent Sampling Params
+    min_cohorts: int = 2,
+    min_cap: int = 30,
+    max_cap: int = 600,
+    median_mult: float = 1.0,
+    **kwargs
 ) -> None:
     """
     Train the Stage 1 model.
     Accepts explicit file paths and all hyperparameters.
-    Now supports parallel processing and hyperparameter lists.
+    Now supports parallel processing, hyperparameter lists, and intelligent down-sampling.
     """
     artifact_handler = Stage1Artifact(output_dir)
     
@@ -51,7 +59,10 @@ def train_stage1(
     log(f"Loading Hallmark Dictionary from {dict_path}...")
     if not os.path.exists(dict_path):
         raise FileNotFoundError(f"Hallmark dictionary not found at {dict_path}")
-    hallmark_dict = pd.read_json(dict_path)
+    
+    # Fixed: Use json.load for robust dictionary loading
+    with open(dict_path, 'r') as f:
+        hallmark_dict = json.load(f)
 
     log(f"Loading Context (PCs) from {pc_path}...")
     pc_data = pd.read_csv(pc_path)
@@ -89,8 +100,8 @@ def train_stage1(
     final_features = feature_candidates
 
     # --- 5. Optimization (Macro + Micro) ---
-    log("Optimizing Hyperparameters (Macro + Micro) on Full Set...")
-    # Updated to pass through new list and parallel parameters
+    log("Optimizing Hyperparameters (Macro + Micro) with Intelligent Sampling...")
+    # Updated to pass through new list, parallel, and sampling parameters
     best_model = tune_elasticnet_macro_micro(
         X=X_selected, 
         y=y_trans, 
@@ -106,32 +117,76 @@ def train_stage1(
         n_jobs=n_jobs,
         n_splits=n_splits,
         seed=seed,
-        max_iter=max_iter
+        max_iter=max_iter,
+        # Sampling params passed here
+        min_cohorts=min_cohorts,
+        min_cap=min_cap,
+        max_cap=max_cap,
+        median_mult=median_mult
     )
 
-    # --- 6. Final OOF Generation ---
-    log("Generating Final OOF with Best Model...")
+    # --- 6. Final OOF Generation (Asymmetric) ---
+    log("Generating Final OOF (Asymmetric: Balanced Train, Full Val)...")
     folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
     oof_preds_linear = np.zeros(len(y))
     
-    for train_idx, val_idx in folds:
-        X_train, X_val = X_selected[train_idx], X_selected[val_idx]
-        y_train_trans = y_trans[train_idx]
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        # --- A. Intelligent Down-sampling on Train Set ---
+        # Reconstruct DataFrame for sampler
+        train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
+        train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
         
+        df_train_meta = pd.DataFrame({
+            'Tissue': train_tissues,
+            'project_id': train_groups,
+            'original_idx': train_idx 
+        })
+        
+        # Apply adaptive sampler
+        df_bal, _ = adaptive_sampler(
+            df_train_meta, 
+            min_coh=min_cohorts,
+            min_c=min_cap,
+            max_c=max_cap,
+            mult=median_mult,
+            seed=seed + fold_idx # Vary seed per fold
+        )
+        final_train_idx = df_bal['original_idx'].values
+        
+        # --- B. Train on Balanced Data ---
         model_fold = clone(best_model)
-        model_fold.fit(X_train, y_train_trans)
+        model_fold.fit(X_selected[final_train_idx], y_trans[final_train_idx])
         
-        val_preds_trans = model_fold.predict(X_val)
+        # --- C. Predict on Full Validation Data ---
+        val_preds_trans = model_fold.predict(X_selected[val_idx])
         val_preds_linear = trans.inverse_transform(val_preds_trans)
         oof_preds_linear[val_idx] = val_preds_linear
 
     oof_metrics = compute_regression_metrics(y, oof_preds_linear)
-    log(f"Stage 1 Final OOF Metrics: {oof_metrics}")
+    log(f"Stage 1 Final OOF Metrics (Full Data): {oof_metrics}")
 
-    # --- 7. Final Training ---
-    log("Retraining final Global Anchor model...")
+    # --- 7. Final Training (Balanced Full Set) ---
+    # We want the final artifact to be fair and unbiased, so we balance the FULL dataset
+    log("Retraining final Global Anchor model on Balanced Full Data...")
+    
+    df_full_meta = pd.DataFrame({
+        'Tissue': tissues,
+        'project_id': groups,
+        'original_idx': np.arange(len(y))
+    })
+    
+    df_full_bal, _ = adaptive_sampler(
+        df_full_meta, 
+        min_coh=min_cohorts,
+        min_c=min_cap,
+        max_c=max_cap,
+        mult=median_mult,
+        seed=seed
+    )
+    final_idx = df_full_bal['original_idx'].values
+    
     final_model = clone(best_model)
-    final_model.fit(X_selected, y_trans)
+    final_model.fit(X_selected[final_idx], y_trans[final_idx])
 
     # --- 8. Orthogonalization (Correlation Ranking) ---
     log("Generating Correlation-based Orthogonalized Dictionary for Stage 2...")
@@ -148,6 +203,7 @@ def train_stage1(
                 if feat in available_set:
                     hallmark_dict_suffixed[h].append(feat)
     
+    # Note: Orthogonalization typically uses the full dataset correlations to be robust
     final_ortho_dict = orthogonalize_by_correlation(
         X=X_full, 
         y=y_trans, 

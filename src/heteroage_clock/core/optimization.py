@@ -2,28 +2,74 @@
 heteroage_clock.core.optimization
 
 Hyperparameter optimization routines.
-Specifically implements the 'Macro + Micro' strategy.
+Specifically implements the 'Macro + Micro' strategy with intelligent down-sampling support.
 """
 
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import ElasticNet
 from joblib import Parallel, delayed
 from heteroage_clock.core.splits import make_stratified_group_folds
+from heteroage_clock.core.sampling import adaptive_sampler
 from heteroage_clock.utils.logging import log
 from typing import Optional, Any, List, Union
 
-def _evaluate_config(alpha: float, l1: float, X, y, folds, trans_func, seed, search_max_iter):
+def _evaluate_config(
+    alpha: float, 
+    l1: float, 
+    X, y, 
+    groups, 
+    tissues, 
+    folds, 
+    trans_func, 
+    seed, 
+    search_max_iter,
+    sampling_params: dict = None
+):
     """
     Internal helper: Evaluates a single alpha/l1 configuration 
     using the Micro + Macro correlation score.
+    Supports Asymmetric Sampling: Train on balanced subset, Validate on full set.
     """
     oof_preds = np.zeros(len(y))
     fold_corrs = []
     
     model = ElasticNet(alpha=alpha, l1_ratio=l1, random_state=seed, max_iter=search_max_iter)
     
-    for train_idx, val_idx in folds:
-        model.fit(X[train_idx], y[train_idx])
+    for fold_idx, (train_idx, val_idx) in enumerate(folds):
+        # --- Intelligent Down-sampling Logic ---
+        if sampling_params:
+            # Reconstruct DataFrame for sampler
+            # Handle both pandas Series and numpy arrays
+            train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
+            train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
+            
+            df_train_meta = pd.DataFrame({
+                'Tissue': train_tissues,
+                'project_id': train_groups,
+                'original_idx': train_idx 
+            })
+            
+            # Apply adaptive sampler
+            # Vary seed per fold (seed + fold_idx) to ensure robustness
+            df_bal, _ = adaptive_sampler(
+                df_train_meta, 
+                min_coh=sampling_params.get('min_cohorts', 1),
+                min_c=sampling_params.get('min_cap', 30),
+                max_c=sampling_params.get('max_cap', 500),
+                mult=sampling_params.get('median_mult', 1.0),
+                seed=seed + fold_idx 
+            )
+            
+            # The indices to use for training are the ones selected by the sampler
+            final_train_idx = df_bal['original_idx'].values
+        else:
+            final_train_idx = train_idx
+
+        # --- Train on (Balanced) Training Set ---
+        model.fit(X[final_train_idx], y[final_train_idx])
+        
+        # --- Predict on (Full) Validation Set ---
         pred = model.predict(X[val_idx])
         
         # Apply inverse transform for evaluation if needed
@@ -54,11 +100,16 @@ def tune_elasticnet_macro_micro(
     n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
-    max_iter: int = 2000
+    max_iter: int = 2000,
+    # New sampling parameters
+    min_cohorts: int = 1,
+    min_cap: int = 30,
+    max_cap: int = 500,
+    median_mult: float = 1.0
 ) -> ElasticNet:
     """
     Grid search for best ElasticNet alpha that maximizes (Micro_R + Macro_R).
-    Supports list inputs and parallel execution.
+    Supports list inputs, parallel execution, and intelligent down-sampling.
     """
     if alphas is None:
         alphas = np.logspace(-4, -0.5, 30).tolist()
@@ -71,14 +122,31 @@ def tune_elasticnet_macro_micro(
         log("Warning: Split failed in optimization. Returning default model.")
         return ElasticNet(alpha=0.01, l1_ratio=l1_ratios[0], random_state=seed)
 
+    # Bundle sampling parameters
+    sampling_params = {
+        'min_cohorts': min_cohorts,
+        'min_cap': min_cap,
+        'max_cap': max_cap,
+        'median_mult': median_mult
+    }
+    
+    # Log the strategy
+    if max_cap < 100000: # Heuristic check if sampling is active/meaningful
+        log(f"Optimization Strategy: Intelligent Down-sampling Active {sampling_params}")
+    else:
+        log("Optimization Strategy: Full Sampling")
+
     param_grid = [(a, l) for a in alphas for l in l1_ratios]
     log(f"Starting Grid Search: {len(param_grid)} configurations using {n_jobs} jobs...")
     
     search_max_iter = max(1000, max_iter // 2)
 
     # Parallel grid search
+    # We pass groups, tissues, and sampling_params to _evaluate_config
     results = Parallel(n_jobs=n_jobs)(
-        delayed(_evaluate_config)(a, l, X, y, folds, trans_func, seed, search_max_iter)
+        delayed(_evaluate_config)(
+            a, l, X, y, groups, tissues, folds, trans_func, seed, search_max_iter, sampling_params
+        )
         for a, l in param_grid
     )
     

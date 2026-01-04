@@ -3,6 +3,7 @@ heteroage_clock.pipeline
 
 High-level orchestration for training and inference.
 Updates: Now accepts explicit file paths and hyperparameters (lists and n_jobs) to support the generic CLI.
+Crucially updated to pass through **kwargs (including sampling parameters) to underlying stages.
 """
 
 import os
@@ -23,11 +24,12 @@ def train_stage1(
     output_dir, pc_path, dict_path, beta_path, chalm_path, camda_path, 
     sweep_file=None, alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, 
     l1_ratio=0.5, alphas=None, l1_ratios=None, n_splits=5, seed=42, 
-    max_iter=2000, n_jobs=-1, project_root=None
+    max_iter=2000, n_jobs=-1, project_root=None,
+    **kwargs # <--- [Added] To capture min_cohorts, min_cap, etc.
 ):
     """
     Wrapper for Stage 1 Training: Global Anchor.
-    Now forwards all paths, hyperparameter lists, and n_jobs for parallel grid search.
+    Now forwards all paths, hyperparameter lists, n_jobs, and sampling params (via kwargs).
     """
     log("=== Pipeline: Starting Stage 1 Training (Global Anchor) ===")
     _train_stage1(
@@ -47,7 +49,8 @@ def train_stage1(
         n_splits=n_splits,
         seed=seed,
         max_iter=max_iter,
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        **kwargs # <--- [Added] Pass sampling params to _train_stage1
     )
     log("=== Pipeline: Stage 1 Training Completed ===\n")
 
@@ -56,11 +59,12 @@ def train_stage2(
     output_dir, stage1_oof, stage1_dict, pc_path, beta_path, chalm_path, camda_path,
     alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, l1_ratio=0.5, 
     alphas=None, l1_ratios=None, n_splits=5, seed=42, max_iter=2000, 
-    n_jobs=-1, project_root=None
+    n_jobs=-1, project_root=None,
+    **kwargs # <--- [Added] To capture sampling params
 ):
     """
     Wrapper for Stage 2 Training: Hallmark Experts.
-    Now forwards all paths, hyperparameter lists, and n_jobs for parallel tuning.
+    Now forwards all paths, hyperparameter lists, n_jobs, and sampling params.
     """
     log("=== Pipeline: Starting Stage 2 Training (Hallmark Experts) ===")
     _train_stage2(
@@ -80,7 +84,8 @@ def train_stage2(
         n_splits=n_splits,
         seed=seed,
         max_iter=max_iter,
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        **kwargs # <--- [Added] Pass sampling params to _train_stage2
     )
     log("=== Pipeline: Stage 2 Training Completed ===\n")
 
@@ -88,7 +93,8 @@ def train_stage2(
 def train_stage3(
     output_dir, stage1_oof, stage2_oof, pc_path,
     n_estimators=2000, learning_rate=0.01, num_leaves=31, 
-    max_depth=-1, n_splits=5, seed=42, n_jobs=-1, project_root=None
+    max_depth=-1, n_splits=5, seed=42, n_jobs=-1, project_root=None,
+    **kwargs # <--- [Added] For consistency
 ):
     """
     Wrapper for Stage 3 Training: Context-Aware Fusion.
@@ -106,7 +112,8 @@ def train_stage3(
         max_depth=max_depth,
         n_splits=n_splits,
         seed=seed,
-        n_jobs=n_jobs
+        n_jobs=n_jobs,
+        **kwargs
     )
     log("=== Pipeline: Stage 3 Training Completed ===\n")
 

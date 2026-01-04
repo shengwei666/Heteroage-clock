@@ -6,6 +6,7 @@ Stage 2: Hallmark Experts
 
 import os
 import glob
+import json
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
@@ -17,6 +18,7 @@ from heteroage_clock.core.splits import make_stratified_group_folds
 from heteroage_clock.core.optimization import tune_elasticnet_macro_micro
 from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage2 import Stage2Artifact
+from heteroage_clock.core.sampling import adaptive_sampler # <--- [Added]
 
 def train_stage2(
     output_dir: str, 
@@ -36,12 +38,18 @@ def train_stage2(
     n_jobs: int = -1,
     n_splits: int = 5,
     seed: int = 42,
-    max_iter: int = 2000
+    max_iter: int = 2000,
+    # New Intelligent Sampling Params
+    min_cohorts: int = 2,
+    min_cap: int = 30,
+    max_cap: int = 600,
+    median_mult: float = 1.0,
+    **kwargs
 ) -> None:
     """
     Train Stage 2 Expert Models.
     Accepts explicit paths and hyperparameters.
-    Now supports parallel processing and hyperparameter lists.
+    Now supports parallel processing, hyperparameter lists, and intelligent sampling.
     """
     artifact_handler = Stage2Artifact(output_dir)
     
@@ -53,16 +61,9 @@ def train_stage2(
     log(f"Loading Dictionary from {stage1_dict_path}...")
     if not os.path.exists(stage1_dict_path): raise FileNotFoundError(stage1_dict_path)
     
-    try:
-        hallmark_dict = pd.read_json(stage1_dict_path)
-        if isinstance(hallmark_dict, pd.DataFrame):
-            hallmark_dict = {k: v.dropna().tolist() for k, v in hallmark_dict.items()}
-        elif isinstance(hallmark_dict, pd.Series):
-             hallmark_dict = hallmark_dict.to_dict()
-    except ValueError:
-        import pickle
-        with open(stage1_dict_path, 'rb') as f:
-            hallmark_dict = pickle.load(f)
+    # Fixed: Use json.load
+    with open(stage1_dict_path, 'r') as f:
+        hallmark_dict = json.load(f)
 
     log("Loading raw omics features...")
     cpg_beta = pd.read_pickle(beta_path)
@@ -75,20 +76,12 @@ def train_stage2(
     
     train_df = pd.merge(assembled_data, stage1_oof, on="sample_id", how="inner", suffixes=("", "_oof"))
     
-    if "project_id" in train_df.columns:
-        groups = train_df["project_id"]
-    elif "project_id_oof" in train_df.columns:
-        groups = train_df["project_id_oof"]
-    else:
-        raise ValueError("Missing project_id for splitting")
-
-    if "Tissue" in train_df.columns:
-        tissues = train_df["Tissue"]
-    elif "Tissue_oof" in train_df.columns:
-        tissues = train_df["Tissue_oof"]
-    else:
-        raise ValueError("Missing Tissue for splitting")
-
+    # Logic to handle potentially different column names after merge
+    group_col = "project_id" if "project_id" in train_df.columns else "project_id_oof"
+    tissue_col = "Tissue" if "Tissue" in train_df.columns else "Tissue_oof"
+    
+    groups = train_df[group_col]
+    tissues = train_df[tissue_col]
     y_global = train_df["residual"].values
     
     # --- 3. Split ---
@@ -108,13 +101,13 @@ def train_stage2(
             
         X = train_df[relevant_cols].values
         
-        # Optimization updated with list and n_jobs support
+        # Optimization (now with sampling params)
         best_model = tune_elasticnet_macro_micro(
             X=X, 
             y=y_global, 
             groups=groups, 
             tissues=tissues, 
-            trans_func=None,
+            trans_func=None, # Predicting residuals directly, no transform needed
             alpha_start=alpha_start,
             alpha_end=alpha_end,
             n_alphas=n_alphas,
@@ -124,22 +117,55 @@ def train_stage2(
             n_jobs=n_jobs,
             n_splits=n_splits,
             seed=seed,
-            max_iter=max_iter
+            max_iter=max_iter,
+            # Pass Sampling Params
+            min_cohorts=min_cohorts,
+            min_cap=min_cap,
+            max_cap=max_cap,
+            median_mult=median_mult
         )
         
+        # OOF Generation with Asymmetric Sampling
         hallmark_oof = np.zeros(len(y_global))
-        for train_idx, val_idx in folds:
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            # --- A. Intelligent Down-sampling on Train Set ---
+            train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
+            train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
+            
+            df_train_meta = pd.DataFrame({
+                'Tissue': train_tissues,
+                'project_id': train_groups,
+                'idx': train_idx 
+            })
+            
+            df_bal, _ = adaptive_sampler(
+                df_train_meta, 
+                min_coh=min_cohorts,
+                min_c=min_cap,
+                max_c=max_cap,
+                mult=median_mult,
+                seed=seed + fold_idx
+            )
+            final_train_idx = df_bal['idx'].values
+            
+            # --- B. Train & Predict ---
             m = clone(best_model)
-            m.fit(X[train_idx], y_global[train_idx])
-            hallmark_oof[val_idx] = m.predict(X[val_idx])
+            m.fit(X[final_train_idx], y_global[final_train_idx]) # Fit on Balanced
+            hallmark_oof[val_idx] = m.predict(X[val_idx]) # Predict on Full
             
         stage2_oof_df[f"pred_residual_{hallmark_clean}"] = hallmark_oof
         
         metrics = compute_regression_metrics(y_global, hallmark_oof)
         log(f"  > Metrics: {metrics}")
         
+        # Final Model Training (Balanced Full Set)
+        df_full_meta = pd.DataFrame({'Tissue': tissues, 'project_id': groups, 'idx': np.arange(len(y_global))})
+        df_full_bal, _ = adaptive_sampler(df_full_meta, min_cohorts, min_cap, max_cap, median_mult, seed)
+        final_idx = df_full_bal['idx'].values
+        
         final_model = clone(best_model)
-        final_model.fit(X, y_global)
+        final_model.fit(X[final_idx], y_global[final_idx])
         
         artifact_handler.save_expert_model(hallmark_clean, final_model)
         artifact_handler.save(f"stage2_{hallmark_clean}_features", relevant_cols)

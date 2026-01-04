@@ -3,7 +3,7 @@ heteroage_clock.cli
 
 Command Line Interface.
 Exposes all file paths and hyperparameters as arguments.
-Updates: Added support for n_jobs and hyperparameter lists for parallel search.
+Updates: Added support for n_jobs, hyperparameter lists, and intelligent sampling params for BOTH Stage 1 and Stage 2.
 """
 
 import argparse
@@ -27,12 +27,13 @@ def main():
     parser = argparse.ArgumentParser(description="HeteroAge-Clock CLI")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    # ==========================
     # --- Stage 1 Train ---
+    # ==========================
     p_s1 = subparsers.add_parser("stage1-train", help="Train Stage 1 Global Anchor")
     p_s1.add_argument("--project-root", type=str, help="Root directory for default path inference")
     p_s1.add_argument("--output-dir", type=str, required=True, help="Directory to save artifacts")
     
-    # Input Files
     p_s1.add_argument("--pc-path", type=str, help="Path to PC covariates CSV")
     p_s1.add_argument("--dict-path", type=str, help="Path to Hallmark JSON Dictionary")
     p_s1.add_argument("--beta-path", type=str, help="Path to Beta Value Pickle")
@@ -40,26 +41,31 @@ def main():
     p_s1.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
     p_s1.add_argument("--sweep-file", type=str, help="Optional sweep file")
     
-    # Hyperparameters (Enhanced for List and Parallel)
     p_s1.add_argument("--alphas", type=float, nargs='+', help="List of alpha values to search")
     p_s1.add_argument("--l1-ratios", type=float, nargs='+', help="List of L1 ratio values to search")
     p_s1.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel jobs for grid search")
     
-    # Existing Hyperparameters
-    p_s1.add_argument("--alpha-start", type=float, default=-4.0, help="Log10 start of alpha range")
-    p_s1.add_argument("--alpha-end", type=float, default=-0.5, help="Log10 end of alpha range")
-    p_s1.add_argument("--n-alphas", type=int, default=30, help="Number of alphas")
-    p_s1.add_argument("--l1-ratio", type=float, default=0.5, help="ElasticNet mixing parameter")
-    p_s1.add_argument("--n-splits", type=int, default=5, help="Number of CV splits")
-    p_s1.add_argument("--seed", type=int, default=42, help="Random seed")
-    p_s1.add_argument("--max-iter", type=int, default=2000, help="Max iterations for solver")
+    p_s1.add_argument("--alpha-start", type=float, default=-4.0)
+    p_s1.add_argument("--alpha-end", type=float, default=-0.5)
+    p_s1.add_argument("--n-alphas", type=int, default=30)
+    p_s1.add_argument("--l1-ratio", type=float, default=0.5)
+    p_s1.add_argument("--n-splits", type=int, default=5)
+    p_s1.add_argument("--seed", type=int, default=42)
+    p_s1.add_argument("--max-iter", type=int, default=2000)
 
+    # Intelligent Sampling Params (Stage 1)
+    p_s1.add_argument("--min-cohorts", type=int, default=1)
+    p_s1.add_argument("--min-cap", type=int, default=30)
+    p_s1.add_argument("--max-cap", type=int, default=500)
+    p_s1.add_argument("--median-mult", type=float, default=1.0)
+
+    # ==========================
     # --- Stage 2 Train ---
+    # ==========================
     p_s2 = subparsers.add_parser("stage2-train", help="Train Stage 2 Hallmark Experts")
     p_s2.add_argument("--project-root", type=str, help="Root directory for default path inference")
     p_s2.add_argument("--output-dir", type=str, required=True)
     
-    # Input Files
     p_s2.add_argument("--stage1-oof", type=str, help="Path to Stage 1 OOF CSV")
     p_s2.add_argument("--stage1-dict", type=str, help="Path to Stage 1 Orthogonalized Dict")
     p_s2.add_argument("--pc-path", type=str, help="Path to PC covariates")
@@ -67,12 +73,10 @@ def main():
     p_s2.add_argument("--chalm-path", type=str, help="Path to Chalm Value Pickle")
     p_s2.add_argument("--camda-path", type=str, help="Path to Camda Value Pickle")
     
-    # Hyperparameters (Enhanced)
     p_s2.add_argument("--alphas", type=float, nargs='+', help="List of alpha values")
     p_s2.add_argument("--l1-ratios", type=float, nargs='+', help="List of L1 ratios")
     p_s2.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel jobs")
     
-    # Existing Hyperparameters
     p_s2.add_argument("--alpha-start", type=float, default=-4.0)
     p_s2.add_argument("--alpha-end", type=float, default=-0.5)
     p_s2.add_argument("--n-alphas", type=int, default=30)
@@ -81,20 +85,24 @@ def main():
     p_s2.add_argument("--seed", type=int, default=42)
     p_s2.add_argument("--max-iter", type=int, default=2000)
 
+    # Intelligent Sampling Params (Stage 2 - NEW)
+    p_s2.add_argument("--min-cohorts", type=int, default=1)
+    p_s2.add_argument("--min-cap", type=int, default=30)
+    p_s2.add_argument("--max-cap", type=int, default=500)
+    p_s2.add_argument("--median-mult", type=float, default=1.0)
+
+    # ==========================
     # --- Stage 3 Train ---
+    # ==========================
     p_s3 = subparsers.add_parser("stage3-train", help="Train Stage 3 Context Fusion")
     p_s3.add_argument("--project-root", type=str, help="Root directory for default path inference")
     p_s3.add_argument("--output-dir", type=str, required=True)
     
-    # Input Files
     p_s3.add_argument("--stage1-oof", type=str, help="Path to Stage 1 OOF CSV")
     p_s3.add_argument("--stage2-oof", type=str, help="Path to Stage 2 OOF CSV")
     p_s3.add_argument("--pc-path", type=str, help="Path to PC covariates")
     
-    # Hyperparameters (Enhanced for Parallel)
     p_s3.add_argument("--n-jobs", type=int, default=-1, help="Number of parallel threads for LightGBM")
-    
-    # Existing Hyperparameters
     p_s3.add_argument("--n-estimators", type=int, default=2000)
     p_s3.add_argument("--learning-rate", type=float, default=0.01)
     p_s3.add_argument("--num-leaves", type=int, default=31)
@@ -154,6 +162,11 @@ def main():
             n_splits=args.n_splits,
             seed=args.seed,
             max_iter=args.max_iter,
+            # Stage 1 Sampling
+            min_cohorts=args.min_cohorts,
+            min_cap=args.min_cap,
+            max_cap=args.max_cap,
+            median_mult=args.median_mult,
             project_root=args.project_root
         )
 
@@ -187,6 +200,11 @@ def main():
             n_splits=args.n_splits,
             seed=args.seed,
             max_iter=args.max_iter,
+            # Stage 2 Sampling (Pass through)
+            min_cohorts=args.min_cohorts,
+            min_cap=args.min_cap,
+            max_cap=args.max_cap,
+            median_mult=args.median_mult,
             project_root=args.project_root
         )
 
