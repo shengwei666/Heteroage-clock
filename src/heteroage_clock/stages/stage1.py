@@ -2,10 +2,14 @@
 heteroage_clock.stages.stage1
 
 Stage 1: Global Anchor
+Updates:
+- Enforced float32 precision for memory efficiency.
+- Added aggressive garbage collection to prevent OOM during Grid Search.
 """
 
 import os
 import json
+import gc # <--- [Added] For memory management
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
@@ -52,6 +56,7 @@ def train_stage1(
     Train the Stage 1 model.
     Accepts explicit file paths and all hyperparameters.
     Now supports parallel processing, hyperparameter lists, and intelligent down-sampling.
+    Includes memory optimizations (float32 + gc).
     """
     artifact_handler = Stage1Artifact(output_dir)
     
@@ -78,17 +83,35 @@ def train_stage1(
     assembled_data = filter_and_impute(assembled_data, features_to_keep=cpg_beta.columns.tolist())
     
     metadata_cols = ["sample_id", "age", "project_id", "Tissue", "Sex", "Is_Healthy", "Sex_encoded"]
-    
     all_cols = assembled_data.columns.tolist()
     feature_candidates = [c for c in all_cols if c not in metadata_cols]
     
-    X_full = assembled_data[feature_candidates].values
-    y = assembled_data["age"].values
+    # --- [MEMORY OPTIMIZATION START] ---
+    log(f"Converting data to float32 and cleaning up memory...")
+    
+    # 1. Extract and convert to float32 immediately
+    X_full = assembled_data[feature_candidates].values.astype(np.float32)
+    y = assembled_data["age"].values.astype(np.float32)
+    
+    # 2. Extract metadata
     groups = assembled_data["project_id"]
     tissues = assembled_data["Tissue"]
     sample_ids = assembled_data["sample_id"].values
+    
+    # 3. Pre-extract optional metadata for OOF saving later (since we will delete assembled_data)
+    meta_sex = assembled_data["Sex"].values if "Sex" in assembled_data.columns else None
+    meta_healthy = assembled_data["Is_Healthy"].values if "Is_Healthy" in assembled_data.columns else None
 
-    log(f"Data assembled. Shape: {X_full.shape}. Candidates: {len(feature_candidates)}")
+    # 4. CRITICAL: Delete huge dataframes and force garbage collection
+    del assembled_data
+    del cpg_beta
+    del chalm_data
+    del camda_data
+    del pc_data
+    gc.collect()
+    
+    log(f"Data assembled. Shape: {X_full.shape}. Memory cleaned.")
+    # --- [MEMORY OPTIMIZATION END] ---
 
     # --- 3. Transform Target ---
     trans = AgeTransformer(adult_age=20)
@@ -102,7 +125,6 @@ def train_stage1(
     # --- 5. Optimization (Macro + Micro) ---
     log("Optimizing Hyperparameters (Macro + Micro) with Intelligent Sampling...")
     # Updated to pass through new list, parallel, and sampling parameters
-    # [CHANGE]: Unpack best_model and sweep_df
     best_model, sweep_df = tune_elasticnet_macro_micro(
         X=X_selected, 
         y=y_trans, 
@@ -126,14 +148,14 @@ def train_stage1(
         median_mult=median_mult
     )
 
-    # [CHANGE]: Save the detailed sweep report
     log("Saving Sweep Report...")
     artifact_handler.save("Stage1_Sweep_Report", sweep_df)
 
     # --- 6. Final OOF Generation (Asymmetric) ---
     log("Generating Final OOF (Asymmetric: Balanced Train, Full Val)...")
     folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
-    oof_preds_linear = np.zeros(len(y))
+    # Use float32 for predictions array too
+    oof_preds_linear = np.zeros(len(y), dtype=np.float32)
     
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
         # --- A. Intelligent Down-sampling on Train Set ---
@@ -233,10 +255,11 @@ def train_stage1(
         "Tissue": tissues.values
     })
     
-    if "Sex" in assembled_data.columns:
-        oof_df["Sex"] = assembled_data["Sex"].values
-    if "Is_Healthy" in assembled_data.columns:
-        oof_df["Is_Healthy"] = assembled_data["Is_Healthy"].values
+    # Use pre-extracted metadata since assembled_data is deleted
+    if meta_sex is not None:
+        oof_df["Sex"] = meta_sex
+    if meta_healthy is not None:
+        oof_df["Is_Healthy"] = meta_healthy
         
     artifact_handler.save_oof_predictions(oof_df)
     log(f"Stage 1 completed. Outputs in {output_dir}")
