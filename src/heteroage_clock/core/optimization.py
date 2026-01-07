@@ -2,8 +2,9 @@
 heteroage_clock.core.optimization
 
 Hyperparameter optimization routines.
-Specifically implements the 'Macro + Micro' strategy with intelligent down-sampling support.
-Updates: Added real-time logging of MAE and MedianAE.
+Updates:
+- Added real-time logging (MAE, MedAE).
+- [Critical] Added batched prediction to prevent OOM when using Memmap data.
 """
 
 import numpy as np
@@ -15,6 +16,35 @@ from heteroage_clock.core.splits import make_stratified_group_folds
 from heteroage_clock.core.sampling import adaptive_sampler
 from heteroage_clock.utils.logging import log
 from typing import Optional, Any, List, Union, Tuple
+
+def _batched_predict(model, X, indices, batch_size=2048):
+    """
+    Helper to predict in chunks.
+    This is crucial when X is a memmap, to avoid loading the entire validation set (X[indices]) into RAM at once.
+    
+    Args:
+        model: Trained sklearn estimator.
+        X: The full feature matrix (can be Memmap).
+        indices: Array of indices to predict on.
+        batch_size: Size of chunks to read from disk.
+        
+    Returns:
+        np.ndarray: Predictions for the indices.
+    """
+    n_samples = len(indices)
+    preds = np.zeros(n_samples, dtype=np.float32)
+    
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        batch_idx = indices[start:end]
+        
+        # X[batch_idx] reads only 'batch_size' rows from disk to RAM
+        # This keeps memory footprint tiny (e.g. <100MB instead of 10GB)
+        batch_preds = model.predict(X[batch_idx])
+        
+        preds[start:end] = batch_preds
+        
+    return preds
 
 def _evaluate_config(
     alpha: float, 
@@ -30,15 +60,14 @@ def _evaluate_config(
 ) -> dict:
     """
     Internal helper: Evaluates a single alpha/l1 configuration.
-    Returns a dictionary of metrics.
     """
-    oof_preds = np.zeros(len(y))
+    oof_preds = np.zeros(len(y), dtype=np.float32)
     fold_corrs = []
     
     model = ElasticNet(alpha=alpha, l1_ratio=l1, random_state=seed, max_iter=search_max_iter)
     
     for fold_idx, (train_idx, val_idx) in enumerate(folds):
-        # --- Intelligent Down-sampling ---
+        # --- Intelligent Down-sampling (Training Set Only) ---
         if sampling_params:
             train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
             train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
@@ -49,7 +78,6 @@ def _evaluate_config(
                 'original_idx': train_idx 
             })
             
-            # Apply adaptive sampler
             df_bal, _ = adaptive_sampler(
                 df_train_meta, 
                 min_coh=sampling_params.get('min_cohorts', 1),
@@ -62,13 +90,15 @@ def _evaluate_config(
         else:
             final_train_idx = train_idx
 
-        # Train
+        # Train: X[final_train_idx] is small (downsampled), so memory usage is low.
+        # Even if X is memmap, we load this subset into RAM for training efficiency.
         model.fit(X[final_train_idx], y[final_train_idx])
         
-        # Predict (Full Validation)
-        pred = model.predict(X[val_idx])
+        # Predict: Val set is LARGE. Use batching to keep memory low.
+        # Using model.predict(X[val_idx]) directly would load HUGE data into RAM and crash.
+        pred = _batched_predict(model, X, val_idx, batch_size=2048)
         
-        # Inverse transform for evaluation
+        # Inverse transform for evaluation (if AgeTransformer is used)
         pred_eval = trans_func.inverse_transform(pred) if trans_func else pred
         y_val_eval = trans_func.inverse_transform(y[val_idx]) if trans_func else y[val_idx]
         
@@ -94,7 +124,7 @@ def _evaluate_config(
     med_ae = median_absolute_error(y_eval_all, oof_preds)
     score = micro_r + macro_r
     
-    # [Updated Log]: Added MedianAE (MedAE)
+    # Real-time Logging
     print(f"  [Evaluate] Alpha={alpha:.5f} L1={l1:.2f} | Score={score:.4f} (MicroR={micro_r:.3f}, MacroR={macro_r:.3f}) MAE={mae:.3f} MedAE={med_ae:.3f}")
 
     return {
@@ -108,7 +138,7 @@ def _evaluate_config(
     }
 
 def tune_elasticnet_macro_micro(
-    X: np.ndarray, 
+    X, # Accepts Memmap or Array
     y: np.ndarray, 
     groups: Any, 
     tissues: Any, 
@@ -129,7 +159,7 @@ def tune_elasticnet_macro_micro(
     median_mult: float = 1.0
 ) -> Tuple[ElasticNet, pd.DataFrame]:
     """
-    Grid search for best ElasticNet.
+    Grid search for best ElasticNet using Macro+Micro correlation score.
     Returns: (best_model, results_dataframe)
     """
     if alphas is None:
@@ -161,7 +191,8 @@ def tune_elasticnet_macro_micro(
     search_max_iter = max(1000, max_iter // 2)
 
     # Run Parallel Search
-    # Verbose=10 ensures progress bar is shown
+    # Joblib efficiently handles Memmap objects passed as 'X' here.
+    # Note: X is passed to subprocesses. Since it's memmap, no copying happens.
     results_list = Parallel(n_jobs=n_jobs, verbose=10)(
         delayed(_evaluate_config)(
             a, l, X, y, groups, tissues, folds, trans_func, seed, search_max_iter, sampling_params

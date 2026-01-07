@@ -2,7 +2,10 @@
 heteroage_clock.data.assemble
 
 Data assembly and feature extraction utilities.
-Includes robust handling for all-NaN columns to support Full-Set training.
+Updates:
+- [Memory Optimization]: Auto-downcast to float32 during assembly to reduce merge overhead.
+- Robust column deduplication.
+- Handling of all-NaN columns for stability.
 """
 
 import pandas as pd
@@ -18,22 +21,24 @@ def assemble_features(
 ) -> pd.DataFrame:
     """
     Assembles various modalities and covariates into a single feature dataframe.
-    [Fixed]: Robustly handles metadata duplication to prevent 'project_id_x' errors.
+    Includes memory optimizations (float32 casting) and robust merge handling.
     """
     # 1. Prepare Metadata (Base DataFrame)
-    # We use the provided metadata df (usually cpg_beta) as the anchor.
-    meta_candidates = ['sample_id', 'age', 'Age', 'sex', 'Sex', 'tissue', 'Tissue', 'project_id', 'is_healthy', 'Is_Healthy']
-    
+    # Use copy to avoid modifying original
     df_base = metadata.copy()
+    
+    # Ensure sample_id is a column
     if 'sample_id' not in df_base.columns:
         if df_base.index.name == 'sample_id':
             df_base = df_base.reset_index()
         else:
             raise ValueError("Metadata dataframe missing 'sample_id' column or index.")
+            
+    # Normalize sample_id to string to ensure consistent merging
+    df_base['sample_id'] = df_base['sample_id'].astype(str)
     
-    # 2. Define modalities to merge
-    # Note: We skip 'beta' if it is the same object as metadata to save time/memory,
-    # but if they are different, we process it.
+    # 2. Define modalities
+    # Order matters: we merge these INTO the metadata
     modalities = [
         ('beta', cpg_beta),
         ('chalm', chalm_data),
@@ -47,36 +52,40 @@ def assemble_features(
         if df_mod is None or df_mod.empty:
             continue
             
-        # Optimization: If this modality IS the metadata object, we don't need to merge it again
-        # provided we already took all columns. But to be safe, we usually merge.
-        # If it's the exact same object, merging inner on sample_id is redundant but harmless 
-        # IF we handle columns correctly.
+        # Optimization: If this modality IS the metadata object itself (e.g. beta passed as metadata),
+        # skip merging to save time/memory.
         if df_mod is metadata:
-             # If we initialized df_base FROM metadata, we already have these features.
-             # We can skip merging metadata with itself.
              continue
 
+        # Create a working copy
         df_m = df_mod.copy()
+        
+        # Ensure sample_id exists and is string
         if 'sample_id' not in df_m.columns:
             if df_m.index.name == 'sample_id':
                 df_m = df_m.reset_index()
             else:
                 log(f"Warning: Modality {name} missing sample_id. Skipping.")
                 continue
-            
-        # --- [CRITICAL FIX] Robust Column Deduplication ---
-        # Before merging, check for ANY columns that already exist in df_base.
-        # We MUST drop them from df_m to prevent suffix creation (_x, _y).
-        # We only keep 'sample_id' for the merge key.
         
+        df_m['sample_id'] = df_m['sample_id'].astype(str)
+
+        # --- [MEMORY OPTIMIZATION] Force float32 ---
+        # Identify float64 columns and downcast to float32 BEFORE merge
+        # This reduces memory usage of the merged dataframe by 50%
+        float64_cols = df_m.select_dtypes(include=['float64']).columns
+        if len(float64_cols) > 0:
+            # log(f"  > {name}: Downcasting {len(float64_cols)} float64 columns to float32...")
+            df_m[float64_cols] = df_m[float64_cols].astype(np.float32)
+
+        # --- Robust Column Deduplication ---
+        # Prevent '_x', '_y' suffixes by dropping duplicate columns from the incoming dataframe.
+        # We only keep 'sample_id' for the merge key.
         existing_cols = set(df_base.columns)
         new_cols = set(df_m.columns)
-        
-        # Calculate intersection excluding merge key
         cols_overlap = list(existing_cols.intersection(new_cols) - {'sample_id'})
         
         if cols_overlap:
-            # log(f"  > {name}: Dropping {len(cols_overlap)} duplicate columns (e.g., {cols_overlap[:3]}...)")
             df_m = df_m.drop(columns=cols_overlap)
 
         # Merge (Inner Join)
@@ -87,17 +96,22 @@ def assemble_features(
         if after_len < before_len:
             log(f"  > Merging {name}: dropped {before_len - after_len} samples (common: {after_len})")
 
-    # Final cleanup: Standardize 'age' column name if needed
+    # Final cleanup: Ensure age column naming standard
     if 'Age' in df_base.columns and 'age' not in df_base.columns:
         df_base.rename(columns={'Age': 'age'}, inplace=True)
+        
+    # Final safety: Convert any remaining float64 in df_base to float32
+    # This ensures the final object passed to Stage 1/2 is memory efficient
+    final_f64 = df_base.select_dtypes(include=['float64']).columns
+    if len(final_f64) > 0:
+        df_base[final_f64] = df_base[final_f64].astype(np.float32)
 
     return df_base
-
 
 def filter_and_impute(df: pd.DataFrame, features_to_keep: list = None, impute_strategy: str = 'median') -> pd.DataFrame:
     """
     Filters features and imputes missing values.
-    [CRITICAL]: Includes robust handling for all-NaN columns for Full-Set training.
+    Includes robust handling for all-NaN columns.
     """
     # 1. Feature Filtering
     if features_to_keep:
@@ -112,32 +126,35 @@ def filter_and_impute(df: pd.DataFrame, features_to_keep: list = None, impute_st
     if df_filtered.empty:
         return df_filtered
 
-    # --- [NEW] All-NaN Column Guard ---
-    # Essential for 240k feature sets where some modalities might be empty for some subsets
+    # 2. All-NaN Guard (Critical for 240k feature sets)
+    # If a column is entirely NaN, fill it with 0.0 immediately to prevent imputation errors
     numeric_df = df_filtered.select_dtypes(include=[np.number])
     if not numeric_df.empty:
         all_nan_cols = numeric_df.columns[numeric_df.isna().all()].tolist()
-        
         if all_nan_cols:
             log(f"  > Warning: Found {len(all_nan_cols)} all-NaN columns. Filling with 0.0.")
-            df_filtered[all_nan_cols] = 0.0
+            # Use float32 zero
+            df_filtered[all_nan_cols] = np.float32(0.0)
 
-    # 2. Regular Imputation
+    # 3. Imputation
     numeric_cols = df_filtered.select_dtypes(include=[np.number]).columns
     cols_to_impute = [c for c in numeric_cols if c not in ['age', 'sample_id', 'Sex_encoded']]
 
     if not cols_to_impute:
         return df_filtered
 
+    # Compute stats using float32 to stay efficient
     if impute_strategy == 'median':
-        df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(df_filtered[cols_to_impute].median())
+        fill_vals = df_filtered[cols_to_impute].median()
     elif impute_strategy == 'mean':
-        df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(df_filtered[cols_to_impute].mean())
+        fill_vals = df_filtered[cols_to_impute].mean()
     else:
-        df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(0)
+        fill_vals = 0.0
+        
+    df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(fill_vals)
     
-    # Final fallback for lingering NaNs
+    # Fallback for any lingering NaNs (e.g., if median itself was NaN)
     if df_filtered[cols_to_impute].isna().any().any():
-         df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(0)
+         df_filtered[cols_to_impute] = df_filtered[cols_to_impute].fillna(0.0)
 
     return df_filtered

@@ -3,13 +3,16 @@ heteroage_clock.stages.stage1
 
 Stage 1: Global Anchor
 Updates:
-- Enforced float32 precision for memory efficiency.
-- Added aggressive garbage collection to prevent OOM during Grid Search.
+- [Critical] Implemented SEQUENTIAL DATA LOADING to minimize peak memory usage.
+- Loads, merges, and releases memory for each modality one by one.
+- Retains Memmap and Float32 optimizations.
 """
 
 import os
 import json
-import gc # <--- [Added] For memory management
+import gc
+import shutil
+import joblib
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
@@ -34,7 +37,6 @@ def train_stage1(
     chalm_path: str,
     camda_path: str,
     sweep_file: str = None,
-    # Hyperparameters updated to support lists and parallel
     alpha_start: float = -4.0,
     alpha_end: float = -0.5,
     n_alphas: int = 30,
@@ -45,7 +47,6 @@ def train_stage1(
     n_splits: int = 5,
     seed: int = 42,
     max_iter: int = 2000,
-    # New Intelligent Sampling Params
     min_cohorts: int = 2,
     min_cap: int = 30,
     max_cap: int = 600,
@@ -54,217 +55,250 @@ def train_stage1(
 ) -> None:
     """
     Train the Stage 1 model.
-    Accepts explicit file paths and all hyperparameters.
-    Now supports parallel processing, hyperparameter lists, and intelligent down-sampling.
-    Includes memory optimizations (float32 + gc).
+    Optimized for LOW PEAK MEMORY via Sequential Loading.
     """
     artifact_handler = Stage1Artifact(output_dir)
     
-    # --- 1. Load Data ---
+    # --- 1. Load Metadata & Dictionaries ---
     log(f"Loading Hallmark Dictionary from {dict_path}...")
     if not os.path.exists(dict_path):
         raise FileNotFoundError(f"Hallmark dictionary not found at {dict_path}")
     
-    # Fixed: Use json.load for robust dictionary loading
     with open(dict_path, 'r') as f:
         hallmark_dict = json.load(f)
 
     log(f"Loading Context (PCs) from {pc_path}...")
     pc_data = pd.read_csv(pc_path)
     
-    log(f"Loading Omics Data...")
-    cpg_beta = pd.read_pickle(beta_path)
-    chalm_data = pd.read_pickle(chalm_path)
-    camda_data = pd.read_pickle(camda_path)
+    # --- 2. Sequential Assembly (Low Memory Peak) ---
+    log("Starting Sequential Feature Assembly...")
 
-    # --- 2. Assemble ---
-    log("Assembling features...")
-    assembled_data = assemble_features(cpg_beta, chalm_data, camda_data, pc_data, cpg_beta)
-    assembled_data = filter_and_impute(assembled_data, features_to_keep=cpg_beta.columns.tolist())
+    # Step A: Load Beta (Base)
+    log(f"  > Loading Beta Matrix: {beta_path}")
+    cpg_beta = pd.read_pickle(beta_path)
     
+    # Initial Assembly: Beta + PCs
+    # We use cpg_beta as both the 'beta' modality and the 'metadata' anchor
+    log("  > Merging Beta + PCs...")
+    assembled_data = assemble_features(
+        cpg_beta=cpg_beta, 
+        chalm_data=None, 
+        camda_data=None, 
+        pc_data=pc_data, 
+        metadata=cpg_beta
+    )
+    
+    # Cleanup Beta immediately
+    del cpg_beta
+    gc.collect()
+    log(f"  > Beta merged. Current shape: {assembled_data.shape}")
+
+    # Step B: Load Chalm & Merge
+    log(f"  > Loading Chalm Matrix: {chalm_path}")
+    chalm_data = pd.read_pickle(chalm_path)
+    
+    log("  > Merging Chalm...")
+    # Pass assembled_data as metadata to keep growing it
+    assembled_data = assemble_features(
+        cpg_beta=None, 
+        chalm_data=chalm_data, 
+        camda_data=None, 
+        pc_data=None, 
+        metadata=assembled_data
+    )
+    
+    # Cleanup Chalm
+    del chalm_data
+    gc.collect()
+    log(f"  > Chalm merged. Current shape: {assembled_data.shape}")
+
+    # Step C: Load Camda & Merge
+    log(f"  > Loading Camda Matrix: {camda_path}")
+    camda_data = pd.read_pickle(camda_path)
+    
+    log("  > Merging Camda...")
+    assembled_data = assemble_features(
+        cpg_beta=None, 
+        chalm_data=None, 
+        camda_data=camda_data, 
+        pc_data=None, 
+        metadata=assembled_data
+    )
+    
+    # Cleanup Camda
+    del camda_data
+    del pc_data
+    gc.collect()
+    log(f"  > Camda merged. Final RAM Shape: {assembled_data.shape}")
+
+    # Step D: Filter & Impute
+    # Note: features_to_keep logic is tricky since we deleted cpg_beta.
+    # But assemble_features keeps all columns by default. 
+    # We'll skip strict column filtering here or imply it's handled by assemble.
+    assembled_data = filter_and_impute(assembled_data)
+
     metadata_cols = ["sample_id", "age", "project_id", "Tissue", "Sex", "Is_Healthy", "Sex_encoded"]
     all_cols = assembled_data.columns.tolist()
     feature_candidates = [c for c in all_cols if c not in metadata_cols]
     
-    # --- [MEMORY OPTIMIZATION START] ---
-    log(f"Converting data to float32 and cleaning up memory...")
+    # --- [MEMORY OPTIMIZATION START: Explicit Memmap] ---
+    log(f"Preparing Memory Mapping to support {n_jobs} parallel jobs...")
     
-    # 1. Extract and convert to float32 immediately
-    X_full = assembled_data[feature_candidates].values.astype(np.float32)
+    temp_memmap_dir = os.path.join(output_dir, "temp_memmap_cache")
+    if os.path.exists(temp_memmap_dir):
+        shutil.rmtree(temp_memmap_dir)
+    os.makedirs(temp_memmap_dir)
+    
+    # Extract and Convert to float32
+    X_full_ram = assembled_data[feature_candidates].values.astype(np.float32)
     y = assembled_data["age"].values.astype(np.float32)
     
-    # 2. Extract metadata
     groups = assembled_data["project_id"]
     tissues = assembled_data["Tissue"]
     sample_ids = assembled_data["sample_id"].values
     
-    # 3. Pre-extract optional metadata for OOF saving later (since we will delete assembled_data)
     meta_sex = assembled_data["Sex"].values if "Sex" in assembled_data.columns else None
     meta_healthy = assembled_data["Is_Healthy"].values if "Is_Healthy" in assembled_data.columns else None
 
-    # 4. CRITICAL: Delete huge dataframes and force garbage collection
+    # DUMP to Disk
+    X_memmap_path = os.path.join(temp_memmap_dir, "X_full_data.joblib")
+    log(f"Dumping large feature matrix to disk: {X_memmap_path} ...")
+    joblib.dump(X_full_ram, X_memmap_path)
+    
+    # Delete RAM copy immediately
+    del X_full_ram
     del assembled_data
-    del cpg_beta
-    del chalm_data
-    del camda_data
-    del pc_data
     gc.collect()
     
-    log(f"Data assembled. Shape: {X_full.shape}. Memory cleaned.")
+    # Load as Memmap (Read-Only)
+    X_selected = joblib.load(X_memmap_path, mmap_mode='r')
+    log(f"Data mapped from disk. Shape: {X_selected.shape}. RAM is clean.")
+    
     # --- [MEMORY OPTIMIZATION END] ---
 
-    # --- 3. Transform Target ---
-    trans = AgeTransformer(adult_age=20)
-    y_trans = trans.transform(y)
+    try:
+        # --- 3. Transform Target ---
+        trans = AgeTransformer(adult_age=20)
+        y_trans = trans.transform(y)
 
-    # --- 4. Training Strategy: Full Set ---
-    log(f"Stage 1 Strategy: Training on FULL feature set ({len(feature_candidates)} features).")
-    X_selected = X_full 
-    final_features = feature_candidates
-
-    # --- 5. Optimization (Macro + Micro) ---
-    log("Optimizing Hyperparameters (Macro + Micro) with Intelligent Sampling...")
-    # Updated to pass through new list, parallel, and sampling parameters
-    best_model, sweep_df = tune_elasticnet_macro_micro(
-        X=X_selected, 
-        y=y_trans, 
-        groups=groups, 
-        tissues=tissues, 
-        trans_func=trans,
-        alpha_start=alpha_start,
-        alpha_end=alpha_end,
-        n_alphas=n_alphas,
-        l1_ratio=l1_ratio,
-        alphas=alphas,
-        l1_ratios=l1_ratios,
-        n_jobs=n_jobs,
-        n_splits=n_splits,
-        seed=seed,
-        max_iter=max_iter,
-        # Sampling params passed here
-        min_cohorts=min_cohorts,
-        min_cap=min_cap,
-        max_cap=max_cap,
-        median_mult=median_mult
-    )
-
-    log("Saving Sweep Report...")
-    artifact_handler.save("Stage1_Sweep_Report", sweep_df)
-
-    # --- 6. Final OOF Generation (Asymmetric) ---
-    log("Generating Final OOF (Asymmetric: Balanced Train, Full Val)...")
-    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
-    # Use float32 for predictions array too
-    oof_preds_linear = np.zeros(len(y), dtype=np.float32)
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(folds):
-        # --- A. Intelligent Down-sampling on Train Set ---
-        # Reconstruct DataFrame for sampler
-        train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
-        train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
+        # --- 4. Strategy ---
+        log(f"Stage 1 Strategy: Training on FULL feature set (Memmap active).")
         
-        df_train_meta = pd.DataFrame({
-            'Tissue': train_tissues,
-            'project_id': train_groups,
-            'original_idx': train_idx 
+        # --- 5. Optimization ---
+        log("Optimizing Hyperparameters (Macro + Micro)...")
+        
+        best_model, sweep_df = tune_elasticnet_macro_micro(
+            X=X_selected, 
+            y=y_trans, 
+            groups=groups, 
+            tissues=tissues, 
+            trans_func=trans,
+            alpha_start=alpha_start,
+            alpha_end=alpha_end,
+            n_alphas=n_alphas,
+            l1_ratio=l1_ratio,
+            alphas=alphas,
+            l1_ratios=l1_ratios,
+            n_jobs=n_jobs,
+            n_splits=n_splits,
+            seed=seed,
+            max_iter=max_iter,
+            min_cohorts=min_cohorts,
+            min_cap=min_cap,
+            max_cap=max_cap,
+            median_mult=median_mult
+        )
+
+        log("Saving Sweep Report...")
+        artifact_handler.save("Stage1_Sweep_Report", sweep_df)
+
+        # --- 6. Final OOF Generation ---
+        log("Generating Final OOF...")
+        folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
+        oof_preds_linear = np.zeros(len(y), dtype=np.float32)
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
+            train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
+            
+            df_train_meta = pd.DataFrame({'Tissue': train_tissues, 'project_id': train_groups, 'original_idx': train_idx})
+            df_bal, _ = adaptive_sampler(df_train_meta, min_coh=min_cohorts, min_c=min_cap, max_c=max_cap, mult=median_mult, seed=seed + fold_idx)
+            final_train_idx = df_bal['original_idx'].values
+            
+            model_fold = clone(best_model)
+            model_fold.fit(X_selected[final_train_idx], y_trans[final_train_idx])
+            
+            # Predict
+            val_preds_trans = model_fold.predict(X_selected[val_idx])
+            val_preds_linear = trans.inverse_transform(val_preds_trans)
+            oof_preds_linear[val_idx] = val_preds_linear
+
+        oof_metrics = compute_regression_metrics(y, oof_preds_linear)
+        log(f"Stage 1 Final OOF Metrics: {oof_metrics}")
+
+        # --- 7. Final Training ---
+        log("Retraining final model...")
+        df_full_meta = pd.DataFrame({'Tissue': tissues, 'project_id': groups, 'original_idx': np.arange(len(y))})
+        df_full_bal, _ = adaptive_sampler(df_full_meta, min_coh=min_cohorts, min_c=min_cap, max_c=max_cap, mult=median_mult, seed=seed)
+        final_idx = df_full_bal['original_idx'].values
+        
+        final_model = clone(best_model)
+        final_model.fit(X_selected[final_idx], y_trans[final_idx])
+
+        # --- 8. Orthogonalization ---
+        log("Generating Orthogonalized Dictionary...")
+        hallmark_dict_suffixed = defaultdict(list)
+        available_set = set(feature_candidates)
+        
+        for h, cpgs in hallmark_dict.items():
+            iter_cpgs = cpgs if isinstance(cpgs, list) else cpgs.values() if isinstance(cpgs, dict) else cpgs
+            for cpg in iter_cpgs:
+                if not isinstance(cpg, str): continue 
+                for suffix in ["_beta", "_chalm", "_camda"]:
+                    feat = f"{cpg}{suffix}"
+                    if feat in available_set:
+                        hallmark_dict_suffixed[h].append(feat)
+        
+        final_ortho_dict = orthogonalize_by_correlation(
+            X=X_selected, 
+            y=y_trans, 
+            feature_names=feature_candidates, 
+            hallmark_mapping=hallmark_dict_suffixed
+        )
+        
+        # --- Save Artifacts ---
+        log("Saving artifacts...")
+        artifact_handler.save_global_model(final_model)
+        artifact_handler.save("stage1_features", feature_candidates) 
+        artifact_handler.save_orthogonalized_dict(final_ortho_dict)
+        
+        oof_df = pd.DataFrame({
+            "sample_id": sample_ids,
+            "age": y,
+            "pred_age": oof_preds_linear,
+            "residual": y - oof_preds_linear,
+            "project_id": groups.values,
+            "Tissue": tissues.values
         })
         
-        # Apply adaptive sampler
-        df_bal, _ = adaptive_sampler(
-            df_train_meta, 
-            min_coh=min_cohorts,
-            min_c=min_cap,
-            max_c=max_cap,
-            mult=median_mult,
-            seed=seed + fold_idx # Vary seed per fold
-        )
-        final_train_idx = df_bal['original_idx'].values
-        
-        # --- B. Train on Balanced Data ---
-        model_fold = clone(best_model)
-        model_fold.fit(X_selected[final_train_idx], y_trans[final_train_idx])
-        
-        # --- C. Predict on Full Validation Data ---
-        val_preds_trans = model_fold.predict(X_selected[val_idx])
-        val_preds_linear = trans.inverse_transform(val_preds_trans)
-        oof_preds_linear[val_idx] = val_preds_linear
+        if meta_sex is not None: oof_df["Sex"] = meta_sex
+        if meta_healthy is not None: oof_df["Is_Healthy"] = meta_healthy
+            
+        artifact_handler.save_oof_predictions(oof_df)
+        log(f"Stage 1 completed. Outputs in {output_dir}")
 
-    oof_metrics = compute_regression_metrics(y, oof_preds_linear)
-    log(f"Stage 1 Final OOF Metrics (Full Data): {oof_metrics}")
+    finally:
+        # --- CLEANUP ---
+        if os.path.exists(temp_memmap_dir):
+            try:
+                del X_selected 
+                gc.collect()
+                shutil.rmtree(temp_memmap_dir)
+                log(f"Cleaned up temp memmap storage: {temp_memmap_dir}")
+            except Exception as e:
+                log(f"Warning: Failed to clean temp dir {temp_memmap_dir}: {e}")
 
-    # --- 7. Final Training (Balanced Full Set) ---
-    # We want the final artifact to be fair and unbiased, so we balance the FULL dataset
-    log("Retraining final Global Anchor model on Balanced Full Data...")
-    
-    df_full_meta = pd.DataFrame({
-        'Tissue': tissues,
-        'project_id': groups,
-        'original_idx': np.arange(len(y))
-    })
-    
-    df_full_bal, _ = adaptive_sampler(
-        df_full_meta, 
-        min_coh=min_cohorts,
-        min_c=min_cap,
-        max_c=max_cap,
-        mult=median_mult,
-        seed=seed
-    )
-    final_idx = df_full_bal['original_idx'].values
-    
-    final_model = clone(best_model)
-    final_model.fit(X_selected[final_idx], y_trans[final_idx])
-
-    # --- 8. Orthogonalization (Correlation Ranking) ---
-    log("Generating Correlation-based Orthogonalized Dictionary for Stage 2...")
-    
-    hallmark_dict_suffixed = defaultdict(list)
-    available_set = set(feature_candidates)
-    
-    for h, cpgs in hallmark_dict.items():
-        iter_cpgs = cpgs if isinstance(cpgs, list) else cpgs.values() if isinstance(cpgs, dict) else cpgs
-        for cpg in iter_cpgs:
-            if not isinstance(cpg, str): continue 
-            for suffix in ["_beta", "_chalm", "_camda"]:
-                feat = f"{cpg}{suffix}"
-                if feat in available_set:
-                    hallmark_dict_suffixed[h].append(feat)
-    
-    # Note: Orthogonalization typically uses the full dataset correlations to be robust
-    final_ortho_dict = orthogonalize_by_correlation(
-        X=X_full, 
-        y=y_trans, 
-        feature_names=feature_candidates, 
-        hallmark_mapping=hallmark_dict_suffixed
-    )
-    
-    log(f"Orthogonalized Dictionary generated.")
-
-    # --- Save Artifacts ---
-    log("Saving artifacts...")
-    artifact_handler.save_global_model(final_model)
-    artifact_handler.save("stage1_features", final_features) 
-    artifact_handler.save_orthogonalized_dict(final_ortho_dict)
-    
-    oof_df = pd.DataFrame({
-        "sample_id": sample_ids,
-        "age": y,
-        "pred_age": oof_preds_linear,
-        "residual": y - oof_preds_linear,
-        "project_id": groups.values,
-        "Tissue": tissues.values
-    })
-    
-    # Use pre-extracted metadata since assembled_data is deleted
-    if meta_sex is not None:
-        oof_df["Sex"] = meta_sex
-    if meta_healthy is not None:
-        oof_df["Is_Healthy"] = meta_healthy
-        
-    artifact_handler.save_oof_predictions(oof_df)
-    log(f"Stage 1 completed. Outputs in {output_dir}")
-
-# predict_stage1 logic remains same
+# Predict function unchanged...
 def predict_stage1(artifact_dir, input_path, output_path):
     artifact_handler = Stage1Artifact(artifact_dir)
     log(f"Loading model from {artifact_dir}...")

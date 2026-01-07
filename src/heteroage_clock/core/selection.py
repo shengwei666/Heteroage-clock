@@ -3,7 +3,9 @@ heteroage_clock.core.selection
 
 Feature selection algorithms.
 Implements Correlation-based Ranking & Orthogonalization (Winner-Takes-All by Rank).
-This ensures stable, deterministic feature assignment across Hallmarks.
+Updates:
+- Optimized 'fast_correlation' to use batched processing.
+- Prevents OOM when calculating correlations on large Memmap arrays.
 """
 
 import numpy as np
@@ -12,41 +14,69 @@ from typing import List, Dict
 from collections import defaultdict
 from heteroage_clock.utils.logging import log
 
-def fast_correlation(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+def fast_correlation(X: np.ndarray, y: np.ndarray, batch_size: int = 2048) -> np.ndarray:
     """
     Calculate Pearson correlation coefficient between each column of X and y.
-    Vectorized implementation for high performance.
+    
+    Memory-Efficient Implementation:
+    - Processes features in batches to avoid allocating a huge 'X_centered' matrix.
+    - Safe to use with large Memmap arrays.
     
     Args:
         X: (n_samples, n_features)
         y: (n_samples,)
+        batch_size: Number of features to process at once.
     
     Returns:
         Array of correlations (n_features,)
     """
-    n = X.shape[0]
-    if n < 2:
-        return np.zeros(X.shape[1])
+    n_samples, n_features = X.shape
+    if n_samples < 2:
+        return np.zeros(n_features, dtype=np.float32)
 
-    # Center inputs
-    X_mean = X.mean(axis=0)
+    # 1. Pre-compute y statistics (small vector, safe in RAM)
+    y = y.astype(np.float32)
     y_mean = y.mean()
-    X_centered = X - X_mean
     y_centered = y - y_mean
+    # Denominator part for y: sum((y-y_mean)^2)
+    y_ss = np.sum(y_centered ** 2)
     
-    # Standard deviation
-    X_std = X.std(axis=0)
-    y_std = y.std()
+    corrs = np.zeros(n_features, dtype=np.float32)
     
-    # Avoid division by zero
-    with np.errstate(divide='ignore', invalid='ignore'):
-        # Covariance * n / (n * std_x * std_y) -> Covariance / (std_x * std_y)
-        # Note: np.dot(u, v) is sum(u_i * v_i), which is numerator of Pearson
-        numerator = np.dot(X_centered.T, y_centered)
-        denominator = n * X_std * y_std + 1e-12
-        corrs = numerator / denominator
+    # 2. Process X in batches of FEATURES (columns)
+    # This avoids creating a (n_samples, n_features) matrix of centered X in RAM.
+    # For a 30k sample x 200k feature matrix, this is the difference between 
+    # crashing (24GB+ needed) vs using <100MB RAM.
     
-    return np.nan_to_num(corrs, nan=0.0)
+    for start in range(0, n_features, batch_size):
+        end = min(start + batch_size, n_features)
+        
+        # Load only a slice of columns into memory
+        # If X is a memmap, this reads from disk.
+        # X_batch shape: (n_samples, current_batch_size)
+        X_batch = X[:, start:end].astype(np.float32)
+        
+        # Center X batch
+        X_mean_batch = X_batch.mean(axis=0)
+        X_centered_batch = X_batch - X_mean_batch
+        
+        # Compute Numerator: dot(y_centered, X_centered)
+        # y_centered is (n_samples,), X_centered_batch is (n_samples, batch)
+        # Result is (batch,)
+        numerators = np.dot(y_centered, X_centered_batch)
+        
+        # Compute Denominator: sqrt(sum(x_c^2) * sum(y_c^2))
+        X_ss_batch = np.sum(X_centered_batch ** 2, axis=0)
+        denominators = np.sqrt(X_ss_batch * y_ss)
+        
+        # Avoid division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            batch_corrs = numerators / (denominators + 1e-12)
+        
+        # Store results
+        corrs[start:end] = np.nan_to_num(batch_corrs, nan=0.0)
+        
+    return corrs
 
 def orthogonalize_by_correlation(
     X: np.ndarray, 
@@ -69,9 +99,9 @@ def orthogonalize_by_correlation(
     if X.shape[1] != len(feature_names):
         raise ValueError(f"Feature count mismatch: X has {X.shape[1]}, names has {len(feature_names)}")
 
-    log("  > Calculating global correlations for ranking...")
+    log("  > Calculating global correlations for ranking (Batch mode)...")
     
-    # 1. Global Correlation Calculation
+    # 1. Global Correlation Calculation (Memory Optimized)
     corrs = fast_correlation(X, y)
     abs_corrs = np.abs(corrs)
     
@@ -112,6 +142,6 @@ def orthogonalize_by_correlation(
         
     return dict(final_ortho_dict)
 
-# Compatibility stub (Optional, keeps old scripts from breaking)
+# Compatibility stub
 def select_features_internal(*args, **kwargs):
     raise NotImplementedError("Use orthogonalize_by_correlation instead.")
