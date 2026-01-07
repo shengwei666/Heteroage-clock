@@ -2,7 +2,7 @@
 
 # 🕰️ HeteroAge-Clock
 
-**An industrial-grade, three-stage biological age prediction pipeline designed for high-performance and reproducible aging research.**
+**A three-stage biological age prediction pipeline designed for high-performance and reproducible aging research.**
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
