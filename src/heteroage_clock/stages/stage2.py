@@ -4,8 +4,9 @@ heteroage_clock.stages.stage2
 Stage 2: Hallmark Experts.
 Trains specific ElasticNet models for each aging hallmark using the residuals from Stage 1.
 Updates: 
-- [Critical] Implemented SEQUENTIAL DATA LOADING to minimize peak memory usage.
-- Retains Disk-based Memory Mapping (Memmap) and Float32 optimizations.
+- [Critical] Implemented INCREMENTAL MEMMAP WRITE to eliminate memory peaks.
+- [Critical] Retains SEQUENTIAL DATA LOADING for input matrices.
+- Forces float32 everywhere.
 """
 
 import os
@@ -55,7 +56,7 @@ def train_stage2(
 ) -> None:
     """
     Train Stage 2 Expert Models.
-    Optimized for LOW PEAK MEMORY via Sequential Loading & Memmap.
+    Optimized for LOW PEAK MEMORY via Sequential Loading & Incremental Memmap.
     """
     artifact_handler = Stage2Artifact(output_dir)
     
@@ -79,21 +80,18 @@ def train_stage2(
     log("Starting Sequential Feature Assembly for Stage 2...")
     
     # Use stage1_oof as the base metadata dataframe
-    # This ensures we only load features for samples that have Stage 1 predictions
     train_df = stage1_oof.copy()
     
-    # Ensure sample_id is string for merging
+    # Ensure sample_id is string
     train_df['sample_id'] = train_df['sample_id'].astype(str)
     pc_data['sample_id'] = pc_data['sample_id'].astype(str)
 
     # Step A: Merge PCs
     log("  > Merging PCs...")
     train_df = pd.merge(train_df, pc_data, on='sample_id', how='inner', suffixes=('', '_dup'))
-    # Clean up duplicate columns if any
     dup_cols = [c for c in train_df.columns if c.endswith('_dup')]
     if dup_cols: train_df.drop(columns=dup_cols, inplace=True)
     
-    # Cleanup PCs
     del pc_data
     gc.collect()
 
@@ -103,7 +101,6 @@ def train_stage2(
     cpg_beta['sample_id'] = cpg_beta['sample_id'].astype(str)
     
     log("  > Merging Beta...")
-    # Using assemble_features logic but iteratively
     train_df = assemble_features(
         cpg_beta=cpg_beta, 
         chalm_data=None, 
@@ -156,8 +153,8 @@ def train_stage2(
     group_col = "project_id" if "project_id" in train_df.columns else "project_id_oof"
     tissue_col = "Tissue" if "Tissue" in train_df.columns else "Tissue_oof"
     
-    # --- [MEMORY OPTIMIZATION START: Memmap] ---
-    log(f"Preparing Memory Mapping for Stage 2 (Supporting {n_jobs} jobs)...")
+    # --- [MEMORY OPTIMIZATION: Incremental Memmap Write] ---
+    log(f"Preparing Memory Mapping (Incremental Write) for Stage 2...")
     
     temp_memmap_dir = os.path.join(output_dir, "stage2_memmap_cache")
     if os.path.exists(temp_memmap_dir):
@@ -182,21 +179,36 @@ def train_stage2(
         # C. Create Feature Map
         feat_to_idx = {name: i for i, name in enumerate(feature_candidates)}
         
-        # D. Dump Full Feature Matrix to Disk
-        X_full_ram = train_df[feature_candidates].values.astype(np.float32)
-        X_memmap_path = os.path.join(temp_memmap_dir, "X_stage2_full.joblib")
+        # D. Incremental Memmap Write
+        shape = (len(train_df), len(feature_candidates))
+        mm_file = os.path.join(temp_memmap_dir, "raw_data.dat")
+        log(f"Initializing Stage 2 memmap on disk: {shape} ...")
         
-        log(f"Dumping Stage 2 feature matrix to {X_memmap_path}...")
-        joblib.dump(X_full_ram, X_memmap_path)
+        fp = np.memmap(mm_file, dtype='float32', mode='w+', shape=shape)
+        
+        chunk_size = 5000
+        total_cols = len(feature_candidates)
+        
+        for i in range(0, total_cols, chunk_size):
+            end = min(i + chunk_size, total_cols)
+            cols_chunk = feature_candidates[i:end]
+            
+            # Write chunk
+            fp[:, i:end] = train_df[cols_chunk].values.astype(np.float32)
+            fp.flush()
+            
+            if i % 20000 == 0:
+                log(f"  > Written {end}/{total_cols} columns to disk...")
+                gc.collect()
         
         # E. Aggressive Cleanup
-        del X_full_ram
         del train_df
+        del fp
         gc.collect()
         
-        # F. Load as Memmap
-        X_full_mmap = joblib.load(X_memmap_path, mmap_mode='r')
-        log(f"Stage 2 Data mapped. Shape: {X_full_mmap.shape}. RAM cleaned.")
+        # F. Re-open as Read-Only Memmap
+        X_full_mmap = np.memmap(mm_file, dtype='float32', mode='r', shape=shape)
+        log(f"Stage 2 Data mapped from disk. Shape: {X_full_mmap.shape}. RAM cleaned.")
 
         # --- 3. Split Folds ---
         folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
@@ -213,8 +225,10 @@ def train_stage2(
             if not indices:
                 log(f"  > Warning: No valid features found for {hallmark_clean}. Skipping.")
                 continue
-                
-            # Extract Feature Subset (Reads from Disk -> RAM)
+            
+            # Extract Feature Subset 
+            # Note: X_full_mmap is on disk. This slices a subset into RAM.
+            # Usually hallmark features are < 5000, so this fits easily in RAM.
             X_hallmark = X_full_mmap[:, indices]
             
             # A. Optimization
@@ -244,7 +258,6 @@ def train_stage2(
             hallmark_oof = np.zeros(len(y_global), dtype=np.float32)
             
             for fold_idx, (train_idx, val_idx) in enumerate(folds):
-                # Reconstruct Metadata for Sampler
                 train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
                 train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
                 
@@ -289,7 +302,9 @@ def train_stage2(
             try:
                 if 'X_full_mmap' in locals():
                     del X_full_mmap
-                    gc.collect()
+                if 'fp' in locals():
+                    del fp
+                gc.collect()
                 shutil.rmtree(temp_memmap_dir)
                 log(f"Cleaned up Stage 2 temp memmap: {temp_memmap_dir}")
             except Exception as e:

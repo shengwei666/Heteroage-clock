@@ -3,9 +3,9 @@ heteroage_clock.stages.stage1
 
 Stage 1: Global Anchor
 Updates:
-- [Critical] Implemented SEQUENTIAL DATA LOADING to minimize peak memory usage.
-- Loads, merges, and releases memory for each modality one by one.
-- Retains Memmap and Float32 optimizations.
+- [Critical] Implemented INCREMENTAL MEMMAP WRITE to eliminate memory peaks during X_full creation.
+- [Critical] Retains SEQUENTIAL DATA LOADING for input matrices.
+- Forces float32 everywhere.
 """
 
 import os
@@ -55,7 +55,7 @@ def train_stage1(
 ) -> None:
     """
     Train the Stage 1 model.
-    Optimized for LOW PEAK MEMORY via Sequential Loading.
+    Optimized for LOW PEAK MEMORY via Sequential Loading & Incremental Memmap.
     """
     artifact_handler = Stage1Artifact(output_dir)
     
@@ -132,27 +132,23 @@ def train_stage1(
     log(f"  > Camda merged. Final RAM Shape: {assembled_data.shape}")
 
     # Step D: Filter & Impute
-    # Note: features_to_keep logic is tricky since we deleted cpg_beta.
-    # But assemble_features keeps all columns by default. 
-    # We'll skip strict column filtering here or imply it's handled by assemble.
     assembled_data = filter_and_impute(assembled_data)
 
     metadata_cols = ["sample_id", "age", "project_id", "Tissue", "Sex", "Is_Healthy", "Sex_encoded"]
     all_cols = assembled_data.columns.tolist()
     feature_candidates = [c for c in all_cols if c not in metadata_cols]
     
-    # --- [MEMORY OPTIMIZATION START: Explicit Memmap] ---
-    log(f"Preparing Memory Mapping to support {n_jobs} parallel jobs...")
+    # --- [MEMORY OPTIMIZATION: Incremental Memmap Write] ---
+    # Instead of creating X_full_ram (which doubles memory), we write to disk in chunks.
+    log(f"Preparing Memory Mapping (Incremental Write) to support {n_jobs} jobs...")
     
     temp_memmap_dir = os.path.join(output_dir, "temp_memmap_cache")
     if os.path.exists(temp_memmap_dir):
         shutil.rmtree(temp_memmap_dir)
     os.makedirs(temp_memmap_dir)
     
-    # Extract and Convert to float32
-    X_full_ram = assembled_data[feature_candidates].values.astype(np.float32)
+    # 1. Extract Metadata into RAM (Small enough)
     y = assembled_data["age"].values.astype(np.float32)
-    
     groups = assembled_data["project_id"]
     tissues = assembled_data["Tissue"]
     sample_ids = assembled_data["sample_id"].values
@@ -160,19 +156,43 @@ def train_stage1(
     meta_sex = assembled_data["Sex"].values if "Sex" in assembled_data.columns else None
     meta_healthy = assembled_data["Is_Healthy"].values if "Is_Healthy" in assembled_data.columns else None
 
-    # DUMP to Disk
-    X_memmap_path = os.path.join(temp_memmap_dir, "X_full_data.joblib")
-    log(f"Dumping large feature matrix to disk: {X_memmap_path} ...")
-    joblib.dump(X_full_ram, X_memmap_path)
+    # 2. Initialize Memmap File on Disk
+    shape = (len(assembled_data), len(feature_candidates))
+    mm_file = os.path.join(temp_memmap_dir, "raw_data.dat")
     
-    # Delete RAM copy immediately
-    del X_full_ram
+    log(f"Initializing memmap on disk: {shape} ...")
+    fp = np.memmap(mm_file, dtype='float32', mode='w+', shape=shape)
+    
+    # 3. Write Features in Chunks
+    # This ensures we never hold the full X matrix in RAM.
+    chunk_size = 5000 # Number of columns to process at a time
+    total_cols = len(feature_candidates)
+    
+    for i in range(0, total_cols, chunk_size):
+        end = min(i + chunk_size, total_cols)
+        cols_chunk = feature_candidates[i:end]
+        
+        # Write chunk to disk
+        fp[:, i:end] = assembled_data[cols_chunk].values.astype(np.float32)
+        
+        # Flush to ensure data hits the disk
+        fp.flush()
+        
+        if i > 0 and i % 20000 == 0:
+            log(f"  > Written {end}/{total_cols} columns to disk...")
+            gc.collect()
+            
+    log(f"  > Finished writing all {total_cols} columns.")
+    
+    # 4. Clean up the massive DataFrame immediately
     del assembled_data
+    del fp # Close the write-mode memmap
     gc.collect()
     
-    # Load as Memmap (Read-Only)
-    X_selected = joblib.load(X_memmap_path, mmap_mode='r')
-    log(f"Data mapped from disk. Shape: {X_selected.shape}. RAM is clean.")
+    # 5. Re-open Memmap in Read-Only Mode
+    # This object acts like a numpy array but reads from disk on demand
+    X_selected = np.memmap(mm_file, dtype='float32', mode='r', shape=shape)
+    log(f"Data mapped from disk (Read-Only). Shape: {X_selected.shape}. RAM is clean.")
     
     # --- [MEMORY OPTIMIZATION END] ---
 
@@ -183,10 +203,11 @@ def train_stage1(
 
         # --- 4. Strategy ---
         log(f"Stage 1 Strategy: Training on FULL feature set (Memmap active).")
-        
+
         # --- 5. Optimization ---
         log("Optimizing Hyperparameters (Macro + Micro)...")
         
+        # X_selected is the Memmap. Joblib handles it efficiently.
         best_model, sweep_df = tune_elasticnet_macro_micro(
             X=X_selected, 
             y=y_trans, 
@@ -229,6 +250,7 @@ def train_stage1(
             model_fold.fit(X_selected[final_train_idx], y_trans[final_train_idx])
             
             # Predict
+            # X_selected is memmap, so this reads from disk
             val_preds_trans = model_fold.predict(X_selected[val_idx])
             val_preds_linear = trans.inverse_transform(val_preds_trans)
             oof_preds_linear[val_idx] = val_preds_linear
@@ -259,6 +281,7 @@ def train_stage1(
                     if feat in available_set:
                         hallmark_dict_suffixed[h].append(feat)
         
+        # Pass Memmap X to orthogonalization too!
         final_ortho_dict = orthogonalize_by_correlation(
             X=X_selected, 
             y=y_trans, 
@@ -291,7 +314,11 @@ def train_stage1(
         # --- CLEANUP ---
         if os.path.exists(temp_memmap_dir):
             try:
-                del X_selected 
+                # Close memmap references
+                if 'X_selected' in locals():
+                    del X_selected 
+                if 'fp' in locals():
+                    del fp
                 gc.collect()
                 shutil.rmtree(temp_memmap_dir)
                 log(f"Cleaned up temp memmap storage: {temp_memmap_dir}")
