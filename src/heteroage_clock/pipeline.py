@@ -2,8 +2,7 @@
 heteroage_clock.pipeline
 
 High-level orchestration for training and inference.
-Updates: Now accepts explicit file paths and hyperparameters (lists and n_jobs) to support the generic CLI.
-Crucially updated to pass through **kwargs (including sampling parameters) to underlying stages.
+Updates: Explicitly handles Optuna parameters (n_trials) for Stage 3.
 """
 
 import os
@@ -25,11 +24,10 @@ def train_stage1(
     sweep_file=None, alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, 
     l1_ratio=0.5, alphas=None, l1_ratios=None, n_splits=5, seed=42, 
     max_iter=2000, n_jobs=-1, project_root=None,
-    **kwargs # <--- [Added] To capture min_cohorts, min_cap, etc.
+    **kwargs 
 ):
     """
     Wrapper for Stage 1 Training: Global Anchor.
-    Now forwards all paths, hyperparameter lists, n_jobs, and sampling params (via kwargs).
     """
     log("=== Pipeline: Starting Stage 1 Training (Global Anchor) ===")
     _train_stage1(
@@ -50,7 +48,7 @@ def train_stage1(
         seed=seed,
         max_iter=max_iter,
         n_jobs=n_jobs,
-        **kwargs # <--- [Added] Pass sampling params to _train_stage1
+        **kwargs
     )
     log("=== Pipeline: Stage 1 Training Completed ===\n")
 
@@ -60,11 +58,10 @@ def train_stage2(
     alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, l1_ratio=0.5, 
     alphas=None, l1_ratios=None, n_splits=5, seed=42, max_iter=2000, 
     n_jobs=-1, project_root=None,
-    **kwargs # <--- [Added] To capture sampling params
+    **kwargs 
 ):
     """
     Wrapper for Stage 2 Training: Hallmark Experts.
-    Now forwards all paths, hyperparameter lists, n_jobs, and sampling params.
     """
     log("=== Pipeline: Starting Stage 2 Training (Hallmark Experts) ===")
     _train_stage2(
@@ -85,7 +82,7 @@ def train_stage2(
         seed=seed,
         max_iter=max_iter,
         n_jobs=n_jobs,
-        **kwargs # <--- [Added] Pass sampling params to _train_stage2
+        **kwargs
     )
     log("=== Pipeline: Stage 2 Training Completed ===\n")
 
@@ -94,13 +91,19 @@ def train_stage3(
     output_dir, stage1_oof, stage2_oof, pc_path,
     n_estimators=2000, learning_rate=0.01, num_leaves=31, 
     max_depth=-1, n_splits=5, seed=42, n_jobs=-1, project_root=None,
-    **kwargs # <--- [Added] For consistency
+    n_trials=0,
+    use_tissue_dummies=False,
+    **kwargs 
 ):
     """
     Wrapper for Stage 3 Training: Context-Aware Fusion.
-    Now forwards path and parallel processing parameters.
+    Updated to support Optuna tuning arguments.
     """
     log("=== Pipeline: Starting Stage 3 Training (Context-Aware Fusion) ===")
+    
+    if n_trials > 0:
+        log(f"   -> Optuna Tuning Enabled: {n_trials} trials")
+        
     _train_stage3(
         output_dir=output_dir,
         stage1_oof_path=stage1_oof,
@@ -113,6 +116,8 @@ def train_stage3(
         n_splits=n_splits,
         seed=seed,
         n_jobs=n_jobs,
+        n_trials=n_trials,
+        use_tissue_dummies=use_tissue_dummies,
         **kwargs
     )
     log("=== Pipeline: Stage 3 Training Completed ===\n")
@@ -123,33 +128,20 @@ def train_stage3(
 # ==============================================================================
 
 def predict_stage1(artifact_dir, input_path, output_path):
-    """
-    Wrapper for Stage 1 Prediction.
-    """
     log("--- Pipeline: Running Stage 1 Inference ---")
     _predict_stage1(artifact_dir, input_path, output_path)
 
 def predict_stage2(artifact_dir, input_path, output_path):
-    """
-    Wrapper for Stage 2 Prediction.
-    """
     log("--- Pipeline: Running Stage 2 Inference ---")
     _predict_stage2(artifact_dir, input_path, output_path)
 
 def predict_stage3(artifact_dir, input_path, output_path):
-    """
-    Wrapper for Stage 3 Prediction.
-    """
     log("--- Pipeline: Running Stage 3 Inference ---")
     _predict_stage3(artifact_dir, input_path, output_path)
 
 def predict_pipeline(artifact_dir, input_path, output_path):
-    """
-    Run the FULL inference pipeline (Stage 1 -> Stage 2 -> Stage 3).
-    """
     log("=== Pipeline: Starting Full Inference Pipeline ===")
     
-    # Define intermediate paths
     base_out_dir = os.path.dirname(output_path)
     os.makedirs(base_out_dir, exist_ok=True)
     
@@ -157,17 +149,16 @@ def predict_pipeline(artifact_dir, input_path, output_path):
     s2_out = os.path.join(base_out_dir, "intermediate_stage2_preds.csv")
     merged_input_s3 = os.path.join(base_out_dir, "intermediate_stage3_input.csv")
     
-    # 1. Stage 1 Inference
+    # 1. Stage 1
     s1_artifacts = os.path.join(artifact_dir, "stage1")
     predict_stage1(s1_artifacts, input_path, s1_out)
     
-    # 2. Stage 2 Inference
+    # 2. Stage 2
     s2_artifacts = os.path.join(artifact_dir, "stage2")
     predict_stage2(s2_artifacts, input_path, s2_out)
     
-    # 3. Merge Data for Stage 3
+    # 3. Merge
     log("--- Pipeline: Merging intermediate results for Stage 3 ---")
-    
     if input_path.endswith('.csv'):
         df_in = pd.read_csv(input_path)
     else:
@@ -176,24 +167,20 @@ def predict_pipeline(artifact_dir, input_path, output_path):
     s1_df = pd.read_csv(s1_out)
     s2_df = pd.read_csv(s2_out)
     
-    # Merge on sample_id
     if "sample_id" not in df_in.columns:
         raise ValueError("Input data missing 'sample_id' column.")
         
     merged = df_in.merge(s1_df[['sample_id', 'pred_age_stage1']], on="sample_id", how="left")
-    
-    # Stage 2 might have many columns, merge all residuals
     s2_cols = [c for c in s2_df.columns if c != 'sample_id']
     merged = merged.merge(s2_df[['sample_id'] + s2_cols], on="sample_id", how="left")
     
-    # Save merged file
     merged.to_csv(merged_input_s3, index=False)
     
-    # 4. Stage 3 Inference
+    # 4. Stage 3
     s3_artifacts = os.path.join(artifact_dir, "stage3")
     predict_stage3(s3_artifacts, merged_input_s3, output_path)
     
-    # Cleanup intermediate files
+    # Cleanup
     if os.path.exists(s1_out): os.remove(s1_out)
     if os.path.exists(s2_out): os.remove(s2_out)
     if os.path.exists(merged_input_s3): os.remove(merged_input_s3)

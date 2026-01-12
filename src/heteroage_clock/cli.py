@@ -3,7 +3,9 @@ heteroage_clock.cli
 
 Command Line Interface.
 Exposes all file paths and hyperparameters as arguments.
-Updates: Added support for n_jobs, hyperparameter lists, and intelligent sampling params for BOTH Stage 1 and Stage 2.
+Updates: 
+1. Added Stage 3 Hyperparameters (n_trials, use_tissue_dummies, model_type).
+2. Maintained support for Stage 1/2 intelligent sampling.
 """
 
 import argparse
@@ -85,7 +87,7 @@ def main():
     p_s2.add_argument("--seed", type=int, default=42)
     p_s2.add_argument("--max-iter", type=int, default=2000)
 
-    # Intelligent Sampling Params (Stage 2 - NEW)
+    # Intelligent Sampling Params (Stage 2)
     p_s2.add_argument("--min-cohorts", type=int, default=2)
     p_s2.add_argument("--min-cap", type=int, default=30)
     p_s2.add_argument("--max-cap", type=int, default=500)
@@ -110,6 +112,19 @@ def main():
     p_s3.add_argument("--n-splits", type=int, default=5)
     p_s3.add_argument("--seed", type=int, default=42)
 
+    # [NEW] Stage 3 Fusion Hyperparameters
+    p_s3.add_argument("--n-trials", type=int, default=0, help="Number of Optuna trials (0 to disable)")
+    p_s3.add_argument("--use-tissue-dummies", action="store_true", help="Include tissue dummies in fusion model")
+    p_s3.add_argument("--model-type", type=str, default="lightgbm", help="Fusion model type")
+    
+    # [NEW] Additional LightGBM Params (Optional pass-through)
+    p_s3.add_argument("--min-child-samples", type=int, default=20)
+    p_s3.add_argument("--reg-alpha", type=float, default=0.1)
+    p_s3.add_argument("--reg-lambda", type=float, default=0.1)
+    p_s3.add_argument("--colsample-bytree", type=float, default=0.8)
+    p_s3.add_argument("--subsample", type=float, default=0.8)
+
+
     # --- Inference Commands ---
     p_pipe = subparsers.add_parser("pipeline-predict", help="Full Pipeline Inference")
     p_pipe.add_argument("--artifact-dir", required=True)
@@ -132,6 +147,8 @@ def main():
     p_p3.add_argument("--out", required=True)
 
     args = parser.parse_args()
+
+    # --- Execution Logic ---
 
     if args.command == "stage1-train":
         pc = resolve_path(args.pc_path, args.project_root, "4.Data_assembly/Feature_Sets/RefGuided_PCs.csv")
@@ -200,7 +217,7 @@ def main():
             n_splits=args.n_splits,
             seed=args.seed,
             max_iter=args.max_iter,
-            # Stage 2 Sampling (Pass through)
+            # Stage 2 Sampling
             min_cohorts=args.min_cohorts,
             min_cap=args.min_cap,
             max_cap=args.max_cap,
@@ -229,7 +246,17 @@ def main():
             max_depth=args.max_depth,
             n_splits=args.n_splits,
             seed=args.seed,
-            project_root=args.project_root
+            project_root=args.project_root,
+            # [NEW] Passing new arguments
+            n_trials=args.n_trials,
+            use_tissue_dummies=args.use_tissue_dummies,
+            model_type=args.model_type,
+            # Optional pass-throughs
+            min_child_samples=args.min_child_samples,
+            reg_alpha=args.reg_alpha,
+            reg_lambda=args.reg_lambda,
+            colsample_bytree=args.colsample_bytree,
+            subsample=args.subsample
         )
 
     elif args.command == "pipeline-predict":
