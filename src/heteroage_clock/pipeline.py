@@ -1,188 +1,170 @@
 """
 heteroage_clock.pipeline
-
-High-level orchestration for training and inference.
-Updates: Explicitly handles Optuna parameters (n_trials) for Stage 3.
+Coordinating the 3-Stage Training and Inference.
+Updated: Extended memory-saving strategies (Selective Loading, Float32, GC) to inference.
 """
 
 import os
 import pandas as pd
+import numpy as np
+import gc
+import joblib
 from heteroage_clock.utils.logging import log
+from heteroage_clock.stages.stage1 import train_stage1, predict_stage1
+from heteroage_clock.stages.stage2 import train_stage2, predict_stage2
+from heteroage_clock.stages.stage3 import train_stage3, predict_stage3
 
-# Import core implementation
-from heteroage_clock.stages.stage1 import train_stage1 as _train_stage1, predict_stage1 as _predict_stage1
-from heteroage_clock.stages.stage2 import train_stage2 as _train_stage2, predict_stage2 as _predict_stage2
-from heteroage_clock.stages.stage3 import train_stage3 as _train_stage3, predict_stage3 as _predict_stage3
-
-
-# ==============================================================================
-# Training Pipeline Wrappers
-# ==============================================================================
-
-def train_stage1(
-    output_dir, pc_path, dict_path, beta_path, chalm_path, camda_path, 
-    sweep_file=None, alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, 
-    l1_ratio=0.5, alphas=None, l1_ratios=None, n_splits=5, seed=42, 
-    max_iter=2000, n_jobs=-1, project_root=None,
-    **kwargs 
-):
-    """
-    Wrapper for Stage 1 Training: Global Anchor.
-    """
-    log("=== Pipeline: Starting Stage 1 Training (Global Anchor) ===")
-    _train_stage1(
-        output_dir=output_dir,
-        pc_path=pc_path,
-        dict_path=dict_path,
-        beta_path=beta_path,
-        chalm_path=chalm_path,
-        camda_path=camda_path,
-        sweep_file=sweep_file,
-        alpha_start=alpha_start,
-        alpha_end=alpha_end,
-        n_alphas=n_alphas,
-        l1_ratio=l1_ratio,
-        alphas=alphas,
-        l1_ratios=l1_ratios,
-        n_splits=n_splits,
-        seed=seed,
-        max_iter=max_iter,
-        n_jobs=n_jobs,
-        **kwargs
-    )
-    log("=== Pipeline: Stage 1 Training Completed ===\n")
-
-
-def train_stage2(
-    output_dir, stage1_oof, stage1_dict, pc_path, beta_path, chalm_path, camda_path,
-    alpha_start=-4.0, alpha_end=-0.5, n_alphas=30, l1_ratio=0.5, 
-    alphas=None, l1_ratios=None, n_splits=5, seed=42, max_iter=2000, 
-    n_jobs=-1, project_root=None,
-    **kwargs 
-):
-    """
-    Wrapper for Stage 2 Training: Hallmark Experts.
-    """
-    log("=== Pipeline: Starting Stage 2 Training (Hallmark Experts) ===")
-    _train_stage2(
-        output_dir=output_dir,
-        stage1_oof_path=stage1_oof,
-        stage1_dict_path=stage1_dict,
-        pc_path=pc_path,
-        beta_path=beta_path,
-        chalm_path=chalm_path,
-        camda_path=camda_path,
-        alpha_start=alpha_start,
-        alpha_end=alpha_end,
-        n_alphas=n_alphas,
-        l1_ratio=l1_ratio,
-        alphas=alphas,
-        l1_ratios=l1_ratios,
-        n_splits=n_splits,
-        seed=seed,
-        max_iter=max_iter,
-        n_jobs=n_jobs,
-        **kwargs
-    )
-    log("=== Pipeline: Stage 2 Training Completed ===\n")
-
-
-def train_stage3(
-    output_dir, stage1_oof, stage2_oof, pc_path,
-    n_estimators=2000, learning_rate=0.01, num_leaves=31, 
-    max_depth=-1, n_splits=5, seed=42, n_jobs=-1, project_root=None,
-    n_trials=0,
-    use_tissue_dummies=False,
-    **kwargs 
-):
-    """
-    Wrapper for Stage 3 Training: Context-Aware Fusion.
-    Updated to support Optuna tuning arguments.
-    """
-    log("=== Pipeline: Starting Stage 3 Training (Context-Aware Fusion) ===")
+def _standardize_ids(df):
+    if 'sample_id' in df.columns:
+        if not df['sample_id'].duplicated().any():
+            return df
     
-    if n_trials > 0:
-        log(f"   -> Optuna Tuning Enabled: {n_trials} trials")
+    for col in ['gsm', 'id', 'Unnamed: 0']:
+        if col in df.columns and not df[col].duplicated().any():
+            df = df.rename(columns={col: 'sample_id'})
+            return df
+
+    df = df.copy()
+    df = df.reset_index().rename(columns={df.index.name if df.index.name else 'index': 'sample_id'})
+    df['sample_id'] = df['sample_id'].astype(str)
+    if df['sample_id'].duplicated().any():
+        df = df.drop_duplicates(subset=['sample_id'], keep='first')
+    return df
+
+def _get_sparse_numeric_features(artifact_dir):
+    numeric_features = set()
+    meta_keys = {'sample_id', 'project_id', 'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy'}
+    
+    # Stage 1
+    s1_feat_path = os.path.join(artifact_dir, "stage1", "stage1_features.pkl")
+    if os.path.exists(s1_feat_path):
+        all_s1_feats = joblib.load(s1_feat_path)
+        numeric_features.update([f for f in all_s1_feats if f not in meta_keys])
+
+    # Stage 2
+    s2_dir = os.path.join(artifact_dir, "stage2")
+    if os.path.exists(s2_dir):
+        feat_files = [f for f in os.listdir(s2_dir) if "features.joblib" in f or "features.pkl" in f]
+        for f_file in feat_files:
+            feats = joblib.load(os.path.join(s2_dir, f_file))
+            numeric_features.update([f for f in feats if f not in meta_keys])
+    
+    return sorted(list(numeric_features))
+
+def _merge_to_memmap_sparse(input_path, input_chalm, input_camda, input_pc, output_dir, numeric_features):
+    log("--- Data Assembly: Building Sparse Numeric Matrix ---")
+    raw_main = pd.read_pickle(input_path) if input_path.endswith('.pkl') else pd.read_csv(input_path)
+    main_df = _standardize_ids(raw_main)
+    
+    sample_ids = main_df['sample_id'].astype(str).values
+    X = np.memmap(os.path.join(output_dir, f"inference_{os.getpid()}.mmap"), 
+                  dtype='float32', mode='w+', shape=(len(sample_ids), len(numeric_features)))
+    X[:] = 0.0 
+    
+    feat_to_idx = {f: i for i, f in enumerate(numeric_features)}
+    
+    def fill_modality(path, suffix):
+        if not path or not os.path.exists(path): return
+        log(f"   Streaming modality: {os.path.basename(path)}")
+        data = _standardize_ids(pd.read_pickle(path) if path.endswith('.pkl') else pd.read_csv(path))
+        data = data.set_index('sample_id').reindex(sample_ids)
         
-    _train_stage3(
-        output_dir=output_dir,
-        stage1_oof_path=stage1_oof,
-        stage2_oof_path=stage2_oof,
-        pc_path=pc_path,
-        n_estimators=n_estimators,
-        learning_rate=learning_rate,
-        num_leaves=num_leaves,
-        max_depth=max_depth,
-        n_splits=n_splits,
-        seed=seed,
-        n_jobs=n_jobs,
-        n_trials=n_trials,
-        use_tissue_dummies=use_tissue_dummies,
-        **kwargs
+        meta_ignore = {'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy', 'sample_id', 'project_id'}
+        rename_map = {c: (c if c.startswith('RF_PC') else f"{c}{suffix}") 
+                      for c in data.columns if c not in meta_ignore}
+        
+        data.rename(columns=rename_map, inplace=True)
+        active_cols = [c for c in data.columns if c in feat_to_idx]
+        if active_cols:
+            target_indices = [feat_to_idx[c] for c in active_cols]
+            X[:, target_indices] = data[active_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values.astype('float32')
+        del data; gc.collect()
+
+    fill_modality(input_path, "_beta")
+    fill_modality(input_chalm, "_chalm")
+    fill_modality(input_camda, "_camda")
+    fill_modality(input_pc, "") 
+    X.flush()
+    
+    # CRITICAL: Preserve 'age' in meta_df for plotting
+    meta_path = os.path.join(output_dir, f"meta_{os.getpid()}.pkl")
+    meta_keys = ['sample_id', 'Tissue', 'Age', 'age', 'Sex', 'project_id', 'Is_Healthy']
+    final_meta_cols = [c for c in meta_keys if c in main_df.columns]
+    main_df[final_meta_cols].to_pickle(meta_path)
+    
+    return X.filename, meta_path
+
+def train_pipeline(output_dir, pc_path, dict_path, beta_path, chalm_path, camda_path, **kwargs):
+    """
+    Sequentially trains Stage 1, Stage 2, and Stage 3.
+    """
+    log("=== Pipeline: Starting Full Training Pipeline ===")
+    
+    s1_dir = os.path.join(output_dir, "stage1")
+    train_stage1(
+        output_dir=s1_dir, pc_path=pc_path, dict_path=dict_path,
+        beta_path=beta_path, chalm_path=chalm_path, camda_path=camda_path, **kwargs
     )
-    log("=== Pipeline: Stage 3 Training Completed ===\n")
-
-
-# ==============================================================================
-# Inference Pipeline Wrappers
-# ==============================================================================
-
-def predict_stage1(artifact_dir, input_path, output_path):
-    log("--- Pipeline: Running Stage 1 Inference ---")
-    _predict_stage1(artifact_dir, input_path, output_path)
-
-def predict_stage2(artifact_dir, input_path, output_path):
-    log("--- Pipeline: Running Stage 2 Inference ---")
-    _predict_stage2(artifact_dir, input_path, output_path)
-
-def predict_stage3(artifact_dir, input_path, output_path):
-    log("--- Pipeline: Running Stage 3 Inference ---")
-    _predict_stage3(artifact_dir, input_path, output_path)
-
-def predict_pipeline(artifact_dir, input_path, output_path):
-    log("=== Pipeline: Starting Full Inference Pipeline ===")
     
-    base_out_dir = os.path.dirname(output_path)
-    os.makedirs(base_out_dir, exist_ok=True)
+    s1_oof = os.path.join(s1_dir, "stage1_oof_predictions.csv")
+    s1_dict = os.path.join(s1_dir, "stage1_orthogonalized_dict.joblib")
     
-    s1_out = os.path.join(base_out_dir, "intermediate_stage1_preds.csv")
-    s2_out = os.path.join(base_out_dir, "intermediate_stage2_preds.csv")
-    merged_input_s3 = os.path.join(base_out_dir, "intermediate_stage3_input.csv")
+    s2_dir = os.path.join(output_dir, "stage2")
+    train_stage2(
+        output_dir=s2_dir, stage1_oof_path=s1_oof, stage1_dict_path=s1_dict,
+        pc_path=pc_path, beta_path=beta_path, chalm_path=chalm_path, camda_path=camda_path, **kwargs
+    )
     
-    # 1. Stage 1
-    s1_artifacts = os.path.join(artifact_dir, "stage1")
-    predict_stage1(s1_artifacts, input_path, s1_out)
+    s2_oof = os.path.join(s2_dir, "stage2_oof_corrections.csv")
     
-    # 2. Stage 2
-    s2_artifacts = os.path.join(artifact_dir, "stage2")
-    predict_stage2(s2_artifacts, input_path, s2_out)
+    s3_dir = os.path.join(output_dir, "stage3")
+    train_stage3(
+        output_dir=s3_dir, stage1_oof_path=s1_oof, stage2_oof_path=s2_oof, pc_path=pc_path, **kwargs
+    )
+    log(f"=== Pipeline: Full Training Finished ===")
+
+def predict_pipeline(artifact_dir, input_path, output_path, **kwargs):
+    log("=== Pipeline: Starting Full-Output Inference ===")
+    mmap_path, meta_path = None, None
+    s1_out, s2_out, s3_out = [output_path + f".s{i}.csv" for i in [1, 2, 3]]
     
-    # 3. Merge
-    log("--- Pipeline: Merging intermediate results for Stage 3 ---")
-    if input_path.endswith('.csv'):
-        df_in = pd.read_csv(input_path)
-    else:
-        df_in = pd.read_pickle(input_path)
+    try:
+        numeric_features = _get_sparse_numeric_features(artifact_dir)
+        mmap_path, meta_path = _merge_to_memmap_sparse(input_path, kwargs.get('input_chalm'), 
+                                                       kwargs.get('input_camda'), kwargs.get('input_pc'), 
+                                                       os.path.dirname(output_path), numeric_features)
         
-    s1_df = pd.read_csv(s1_out)
-    s2_df = pd.read_csv(s2_out)
-    
-    if "sample_id" not in df_in.columns:
-        raise ValueError("Input data missing 'sample_id' column.")
+        # Execute Stages
+        predict_stage1(os.path.join(artifact_dir, "stage1"), mmap_path, meta_path, s1_out, numeric_features)
+        predict_stage2(os.path.join(artifact_dir, "stage2"), mmap_path, meta_path, s2_out, numeric_features)
         
-    merged = df_in.merge(s1_df[['sample_id', 'pred_age_stage1']], on="sample_id", how="left")
-    s2_cols = [c for c in s2_df.columns if c != 'sample_id']
-    merged = merged.merge(s2_df[['sample_id'] + s2_cols], on="sample_id", how="left")
-    
-    merged.to_csv(merged_input_s3, index=False)
-    
-    # 4. Stage 3
-    s3_artifacts = os.path.join(artifact_dir, "stage3")
-    predict_stage3(s3_artifacts, merged_input_s3, output_path)
-    
-    # Cleanup
-    if os.path.exists(s1_out): os.remove(s1_out)
-    if os.path.exists(s2_out): os.remove(s2_out)
-    if os.path.exists(merged_input_s3): os.remove(merged_input_s3)
-    
-    log(f"=== Pipeline: Full Inference Completed. Final results at {output_path} ===")
+        # Merge S1 and S2 for S3 input
+        df_meta = pd.read_pickle(meta_path)
+        df_s1 = pd.read_csv(s1_out)
+        df_s2 = pd.read_csv(s2_out)
+        
+        s3_input_df = pd.merge(df_meta, df_s1, on='sample_id').merge(df_s2, on='sample_id')
+        s3_temp_path = output_path + ".s3_in.pkl"
+        s3_input_df.to_pickle(s3_temp_path)
+        
+        predict_stage3(os.path.join(artifact_dir, "stage3"), s3_temp_path, s3_out)
+        
+        # FINAL GRAND MERGE
+        log("--- Finalizing Comprehensive Output ---")
+        df_s3 = pd.read_csv(s3_out)
+        final_df = pd.merge(s3_input_df, df_s3[['sample_id', 'pred_residual_stage3', 'HeteroAge']], on='sample_id')
+        
+        # Calculate Stage 1 Residual
+        age_col = 'age' if 'age' in final_df.columns else 'Age'
+        if age_col in final_df.columns:
+            final_df['pred_residual_stage1'] = final_df[age_col] - final_df['pred_age_stage1']
+        
+        final_df.to_csv(output_path, index=False)
+        log(f"=== Success: Full results saved to {output_path} ===")
+        
+    except Exception as e:
+        log(f"❌ Failed: {e}"); raise e
+    finally:
+        for f in [s1_out, s2_out, s3_out, s3_temp_path, mmap_path, meta_path]:
+            if f and os.path.exists(f): os.remove(f)
+        gc.collect()

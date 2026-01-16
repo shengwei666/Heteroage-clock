@@ -5,7 +5,7 @@ Command Line Interface.
 Exposes all file paths and hyperparameters as arguments.
 Updates: 
 1. Added Stage 3 Hyperparameters (n_trials, use_tissue_dummies, model_type).
-2. Maintained support for Stage 1/2 intelligent sampling.
+2. [New] Added multi-modal inputs for pipeline-predict (chalm, camda, pc).
 """
 
 import argparse
@@ -125,11 +125,18 @@ def main():
     p_s3.add_argument("--subsample", type=float, default=0.8)
 
 
+    # ==========================
     # --- Inference Commands ---
+    # ==========================
     p_pipe = subparsers.add_parser("pipeline-predict", help="Full Pipeline Inference")
     p_pipe.add_argument("--artifact-dir", required=True)
-    p_pipe.add_argument("--input", required=True)
-    p_pipe.add_argument("--out", required=True)
+    p_pipe.add_argument("--input", required=True, help="Main input (Beta) pickle file")
+    p_pipe.add_argument("--out", required=True, help="Output CSV path")
+    
+    # [NEW] Multi-modal inference arguments
+    p_pipe.add_argument("--input-chalm", help="Path to Chalm matrix pickle")
+    p_pipe.add_argument("--input-camda", help="Path to Camda matrix pickle")
+    p_pipe.add_argument("--input-pc", help="Path to PC file")
 
     p_p1 = subparsers.add_parser("stage1-predict", help="Stage 1 Inference")
     p_p1.add_argument("--artifact-dir", required=True)
@@ -247,11 +254,9 @@ def main():
             n_splits=args.n_splits,
             seed=args.seed,
             project_root=args.project_root,
-            # [NEW] Passing new arguments
             n_trials=args.n_trials,
             use_tissue_dummies=args.use_tissue_dummies,
             model_type=args.model_type,
-            # Optional pass-throughs
             min_child_samples=args.min_child_samples,
             reg_alpha=args.reg_alpha,
             reg_lambda=args.reg_lambda,
@@ -260,7 +265,16 @@ def main():
         )
 
     elif args.command == "pipeline-predict":
-        predict_pipeline(args.artifact_dir, args.input, args.out)
+        # [NEW] Pass new arguments to pipeline
+        predict_pipeline(
+            args.artifact_dir, 
+            args.input, 
+            args.out,
+            input_chalm=args.input_chalm,
+            input_camda=args.input_camda,
+            input_pc=args.input_pc
+        )
+
     elif args.command == "stage1-predict":
         predict_stage1(args.artifact_dir, args.input, args.out)
     elif args.command == "stage2-predict":

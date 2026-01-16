@@ -2,11 +2,8 @@
 heteroage_clock.data.assemble
 
 Data assembly and feature extraction utilities.
-Updates:
-- [Critical Fix] REMOVED df.copy() to prevent memory doubling (In-place operation).
-- [Critical Fix] Reduced chunk size to 1000 for extreme safety.
-- Auto-suffixing to prevent data loss.
-- Auto-downcast to float32.
+Optimized for high memory efficiency by removing redundant copies and 
+enforcing float32 precision early in the process.
 """
 
 import pandas as pd
@@ -23,16 +20,20 @@ def assemble_features(
     metadata: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Assembles various modalities into a single dataframe with AUTO-SUFFIXING.
+    Assembles various modalities into a single dataframe.
+    Memory Strategy: 
+    1. Removed redundant df.copy() calls.
+    2. Immediate downcasting to float32.
+    3. Manual garbage collection between merges.
     """
-    # 1. Prepare Metadata
-    df_base = metadata.copy()
+    # 1. Prepare Metadata (Use the reference, only copy if necessary for indexing)
+    df_base = metadata
     if 'sample_id' not in df_base.columns:
         if df_base.index.name == 'sample_id':
             df_base = df_base.reset_index()
     df_base['sample_id'] = df_base['sample_id'].astype(str)
     
-    # 2. Define modalities
+    # 2. Define modalities to iterate through
     modalities = [
         ('beta', cpg_beta, '_beta'),
         ('chalm', chalm_data, '_chalm'),
@@ -44,44 +45,45 @@ def assemble_features(
     meta_cols = {'sample_id', 'project_id', 'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy', 'Sex_encoded'}
 
     for name, df_mod, suffix in modalities:
-        if df_mod is None or df_mod.empty: continue
-        if df_mod is metadata: continue
+        if df_mod is None or df_mod.empty: 
+            continue
+        if df_mod is metadata: 
+            continue
 
-        df_m = df_mod.copy()
-        if 'sample_id' not in df_m.columns:
-            if df_m.index.name == 'sample_id': df_m = df_m.reset_index()
-        df_m['sample_id'] = df_m['sample_id'].astype(str)
+        # Process each modality dataframe
+        if 'sample_id' not in df_mod.columns:
+            if df_mod.index.name == 'sample_id': 
+                df_mod = df_mod.reset_index()
+        df_mod['sample_id'] = df_mod['sample_id'].astype(str)
 
-        # Auto-Suffixing
+        # Auto-Suffixing features to avoid collisions
         if suffix:
             rename_map = {}
-            for col in df_m.columns:
+            for col in df_mod.columns:
                 if col not in meta_cols and not col.endswith(suffix):
                     rename_map[col] = f"{col}{suffix}"
             if rename_map:
-                log(f"  > {name}: Adding suffix '{suffix}' to {len(rename_map)} columns...")
-                df_m.rename(columns=rename_map, inplace=True)
+                df_mod.rename(columns=rename_map, inplace=True)
 
-        # Force float32
-        float64_cols = df_m.select_dtypes(include=['float64']).columns
-        if len(float64_cols) > 0:
-            df_m[float64_cols] = df_m[float64_cols].astype(np.float32)
+        # Force float32 precision to save 50% RAM
+        f64_cols = df_mod.select_dtypes(include=['float64']).columns
+        if len(f64_cols) > 0:
+            df_mod[f64_cols] = df_mod[f64_cols].astype(np.float32)
 
-        # Robust Deduplication
+        # Drop overlapping columns except sample_id before merge
         existing_cols = set(df_base.columns)
-        new_cols = set(df_m.columns)
-        cols_overlap = list(existing_cols.intersection(new_cols) - {'sample_id'})
-        if cols_overlap:
-            df_m.drop(columns=cols_overlap, inplace=True)
+        new_cols = set(df_mod.columns)
+        overlap = list(existing_cols.intersection(new_cols) - {'sample_id'})
+        if overlap:
+            df_mod.drop(columns=overlap, inplace=True)
 
-        # Merge
-        before_len = len(df_base)
-        df_base = pd.merge(df_base, df_m, on='sample_id', how='inner')
-        after_len = len(df_base)
-        if after_len < before_len:
-            log(f"  > Merging {name}: dropped {before_len - after_len} samples (common: {after_len})")
+        # Perform inner merge
+        df_base = pd.merge(df_base, df_mod, on='sample_id', how='inner')
+        
+        # Immediate cleanup of temporary pointers
+        gc.collect()
 
-    # Cleanup
+    # Final cleanup of data types
     if 'Age' in df_base.columns and 'age' not in df_base.columns:
         df_base.rename(columns={'Age': 'age'}, inplace=True)
     
@@ -93,50 +95,38 @@ def assemble_features(
 
 def filter_and_impute(df: pd.DataFrame, features_to_keep: list = None, impute_strategy: str = 'median') -> pd.DataFrame:
     """
-    Filters features and imputes missing values using CHUNKED IN-PLACE processing.
+    Filters features and imputes missing values using chunked processing to prevent OOM.
     """
-    # 1. Feature Filtering
+    # 1. Feature Filtering: Only keep what is required
     if features_to_keep:
         meta_cols = ['sample_id', 'age', 'project_id', 'Tissue', 'Sex', 'Is_Healthy', 'Sex_encoded']
         existing_meta = [c for c in meta_cols if c in df.columns]
         valid_features = [f for f in features_to_keep if f in df.columns]
-        cols_final = list(set(existing_meta + valid_features))
-        
-        # Here we assume df can be subsetted. 
-        # Ideally, we modify df in place, but subsetting creates a copy anyway.
-        # However, filtering REDUCES size, so this copy is safe/beneficial.
-        df_filtered = df[cols_final] # Not .copy() explicit, pandas decides view/copy
-        # Force garbage collection of the old 'df' reference if possible from caller side?
-        # We can't clear caller's variable, but we return a new one.
+        df_filtered = df[list(set(existing_meta + valid_features))]
     else:
-        # [CRITICAL CHANGE] Do NOT use df.copy() here. Use reference.
-        # We are modifying in-place to save 50GB+ RAM.
         df_filtered = df 
 
-    if df_filtered.empty: return df_filtered
+    if df_filtered.empty: 
+        return df_filtered
 
-    # 2. Identify Numeric Columns
+    # 2. Identify Numeric Columns for Imputation
     numeric_cols = df_filtered.select_dtypes(include=[np.number]).columns
     cols_to_impute = [c for c in numeric_cols if c not in ['age', 'sample_id', 'Sex_encoded', 'Age', 'project_id']]
 
     if not cols_to_impute:
         return df_filtered
 
-    log(f"  > Starting Chunked Imputation for {len(cols_to_impute)} columns (Chunk=1000)...")
-    
-    # Explicit GC before the big loop to clear any fragmentation
+    log(f"Starting chunked imputation for {len(cols_to_impute)} columns (Chunk Size: 1000)...")
     gc.collect()
 
-    # 4. Chunked Imputation
-    # Reduced chunk size to 1000 to be extremely safe against allocation overhead
+    # 3. Chunked In-place Imputation
     chunk_size = 1000
     total_cols = len(cols_to_impute)
     
     for i in range(0, total_cols, chunk_size):
         chunk = cols_to_impute[i:i+chunk_size]
-        
         try:
-            # Calculate stats for just this chunk
+            # Calculate and fill per chunk to minimize RAM peak
             if impute_strategy == 'median':
                 fill_vals = df_filtered[chunk].astype(np.float32).median()
             elif impute_strategy == 'mean':
@@ -144,20 +134,18 @@ def filter_and_impute(df: pd.DataFrame, features_to_keep: list = None, impute_st
             else:
                 fill_vals = 0.0
                 
-            # Fill NA in place for this chunk
             df_filtered[chunk] = df_filtered[chunk].fillna(fill_vals)
             
-            # Fallback for all-NaN columns in this chunk (fill with 0)
+            # Fallback for columns containing only NaNs
             if df_filtered[chunk].isna().any().any():
                  df_filtered[chunk] = df_filtered[chunk].fillna(0.0)
         except Exception as e:
-            log(f"Warning: Error processing chunk {i}: {e}")
+            log(f"Warning: Error processing imputation chunk at index {i}: {e}")
              
-        # Explicit GC to be safe
         if i % 10000 == 0:
-            log(f"    - Imputed {i}/{total_cols} columns...")
-            sys.stdout.flush() # Force log output immediately
+            log(f"   Processed {i}/{total_cols} columns...")
+            sys.stdout.flush()
             gc.collect()
 
-    log("  > Imputation completed.")
+    log("Data imputation completed successfully.")
     return df_filtered

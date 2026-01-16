@@ -354,41 +354,101 @@ def train_stage1(
             except Exception as e:
                 log(f"Warning: Failed to clean temp dir: {e}")
 
-def predict_stage1(artifact_dir, input_path, output_path):
-    artifact_handler = Stage1Artifact(artifact_dir)
-    log(f"Loading model from {artifact_dir}...")
-    model = artifact_handler.load_global_model()
-    feature_cols = artifact_handler.load("stage1_features")
+def predict_stage1(artifact_dir, mmap_path, meta_path, output_path, all_features):
+    """
+    Inference for Stage 1 using numeric memmap with safety padding.
     
-    if input_path.endswith('.csv'):
-        data = pd.read_csv(input_path)
-    else:
-        data = pd.read_pickle(input_path)
-    
-    if "Sex_encoded" in feature_cols and "Sex_encoded" not in data.columns:
-         if "Sex" in data.columns:
-             data["Sex_encoded"] = data["Sex"].map({"F": 0, "M": 1, "Female": 0, "Male": 1}).fillna(0)
-         else:
-             data["Sex_encoded"] = 0
+    Args:
+        artifact_dir: Directory containing stage1_model.pkl and stage1_features.pkl.
+        mmap_path: Path to the binary float32 feature matrix.
+        meta_path: Path to the metadata pickle.
+        output_path: Path to save the S1 predictions.
+        all_features: List of feature names present in the memmap.
+    """
+    log(">>> [Stage 1] Running Sparse Global Prediction with Alignment...")
 
-    missing = [c for c in feature_cols if c not in data.columns]
-    if missing:
-        for c in missing: data[c] = 0.0
+    # 1. Load Model Artifacts
+    artifact_handler = Stage1Artifact(artifact_dir)
+    model = artifact_handler.load_global_model()
     
-    X = data[feature_cols].values
-    trans = AgeTransformer(adult_age=20)
-    preds_trans = model.predict(X)
-    preds_linear = trans.inverse_transform(preds_trans)
-    
-    out_df = pd.DataFrame()
-    if "sample_id" in data.columns:
-        out_df["sample_id"] = data["sample_id"]
-    out_df["pred_age_stage1"] = preds_linear
-    
-    if "age" in data.columns:
-        out_df["age"] = data["age"]
-        out_df["residual_stage1"] = out_df["age"] - out_df["pred_age_stage1"]
+    # Load feature names used during training
+    feat_pkl = os.path.join(artifact_dir, "stage1_features.pkl")
+    if os.path.exists(feat_pkl):
+        s1_features = joblib.load(feat_pkl)
+    else:
+        s1_features = artifact_handler.load("stage1_features")
         
+    if isinstance(s1_features, pd.Index):
+        s1_features = s1_features.tolist()
+
+    # 2. Extract Non-Zero Coefficients (Active Features)
+    if hasattr(model, 'coef_'):
+        coefs = model.coef_
+    elif hasattr(model, 'best_estimator_'):
+        coefs = model.best_estimator_.coef_
+    else:
+        try:
+            coefs = model.steps[-1][1].coef_
+        except Exception:
+            log("   ! Warning: Model coefficients not found. Using zero weights.")
+            coefs = np.zeros(len(s1_features))
+
+    # Flatten coefficients if they are 2D (some models return [[...]])
+    coefs = np.array(coefs).flatten()
+
+    # Identify features with non-zero impact
+    nonzero_mask = np.abs(coefs) > 1e-12
+    active_features = [s1_features[i] for i, val in enumerate(nonzero_mask) if val]
+    active_coefs = coefs[nonzero_mask]
+    
+    n_active = len(active_features)
+    log(f"   > Active features: {n_active} identified from training set.")
+
+    # 3. Access Numeric Memmap and Align
+    meta_df = pd.read_pickle(meta_path)
+    n_samples = len(meta_df)
+    n_features_available = len(all_features)
+    
+    # Read-only memmap access
+    X_full = np.memmap(mmap_path, dtype='float32', mode='r', shape=(n_samples, n_features_available))
+    
+    # Fast lookup for available features
+    feat_to_idx = {f: i for i, f in enumerate(all_features)}
+    
+    # --- FEATURE ALIGNMENT & PADDING ---
+    # We create a matrix specifically for the active features
+    X_active = np.zeros((n_samples, n_active), dtype=np.float32)
+    
+    found_count = 0
+    for i, feat_name in enumerate(active_features):
+        if feat_name in feat_to_idx:
+            X_active[:, i] = X_full[:, feat_to_idx[feat_name]]
+            found_count += 1
+            
+    log(f"   > Aligned {found_count}/{n_active} active features. Missing sites filled with 0.")
+
+    # 4. Calculation
+    intercept = model.intercept_ if hasattr(model, 'intercept_') else 0
+    if isinstance(intercept, (list, np.ndarray)):
+        intercept = intercept[0]
+        
+    # Standard dot product prediction
+    raw_preds = np.dot(X_active, active_coefs) + intercept
+    
+    # 5. Transform back to Chronological Age
+    trans = AgeTransformer(adult_age=20)
+    final_preds = trans.inverse_transform(raw_preds)
+    
+    # 6. Save results
+    res_df = pd.DataFrame({
+        "sample_id": meta_df["sample_id"].values,
+        "pred_age_stage1": final_preds
+    })
+    
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    out_df.to_csv(output_path, index=False)
-    log(f"Predictions saved to {output_path}")
+    res_df.to_csv(output_path, index=False)
+    
+    # 7. Cleanup
+    del X_full, X_active, meta_df, model, active_coefs
+    gc.collect()
+    log(f"   > Stage 1 completed. Result: {os.path.basename(output_path)}")

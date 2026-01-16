@@ -1,183 +1,145 @@
 """
 heteroage_clock.stages.stage3
 
-Stage 3: Context-Aware Fusion (Ridge Regression Strategy).
-WINNER MODEL: Best performance (MAE ~5.57).
-
-REASONING:
-- Ridge Regression handles the multicollinearity of biological hallmarks better than Lasso/ElasticNet.
-- It preserves the "team effort" of multiple experts rather than selecting just one.
+Stage 3: Context-Aware Fusion.
+Simplified version: Only uses Stage 2 residuals to predict Stage 1 error.
+Final Age = Stage 1 Prediction + Stage 3 Residual Correction.
 """
 
 import os
+import gc
 import joblib
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import RidgeCV
-from sklearn.metrics import mean_absolute_error, r2_score
-from heteroage_clock.core.metrics import compute_regression_metrics
-from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage3 import Stage3Artifact
+from heteroage_clock.utils.logging import log
 
 def train_stage3(
     output_dir: str,
     stage1_oof_path: str,
     stage2_oof_path: str,
-    pc_path: str,
-    # --- Ridge Hyperparameters ---
-    alphas: tuple = (0.1, 1.0, 10.0, 100.0, 500.0, 1000.0), # Extended range for robustness
+    alphas: tuple = (0.1, 1.0, 10.0, 100.0, 500.0, 1000.0),
     min_samples_for_tissue: int = 50,
-    n_splits: int = 5,
-    seed: int = 42,
-    n_jobs: int = -1,
     **kwargs
 ) -> None:
     """
-    Train Stage 3 using Tissue-Specific Ridge Regression.
+    Train Stage 3 fusion models using expert residuals to correct Stage 1 error.
     """
     artifact_handler = Stage3Artifact(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Data Loading & Assembly
-    log(">>> [Stage 3] Loading Artifacts (Strategy: Ridge Regression - The Winner)...")
+    log(">>> [Stage 3 Training] Training simplified residual fusion models...")
     
-    s1 = pd.read_csv(stage1_oof_path)
-    s2 = pd.read_csv(stage2_oof_path)
+    # Load Stage 1 and Stage 2 results
+    df_s1 = pd.read_csv(stage1_oof_path)
+    df_s2 = pd.read_csv(stage2_oof_path)
     
-    # Standardization
-    if 'Stage1_Pred' in s1.columns and 'pred_age' not in s1.columns: s1.rename(columns={'Stage1_Pred': 'pred_age'}, inplace=True)
-    if 'Age' in s1.columns and 'age' not in s1.columns: s1.rename(columns={'Age': 'age'}, inplace=True)
+    # Ensure column names are standardized
+    if 'pred_age_stage1' not in df_s1.columns and 'Stage1_Pred' in df_s1.columns:
+        df_s1.rename(columns={'Stage1_Pred': 'pred_age_stage1'}, inplace=True)
         
-    expert_cols_age = [c for c in s2.columns if c.startswith("pred_age_") and c != 'pred_age']
-    expert_cols_res = [c for c in s2.columns if c.startswith("pred_residual_")]
-    expert_cols = expert_cols_age + expert_cols_res
-
-    # Merge
-    cols_to_merge_s2 = ["sample_id"] + expert_cols
-    df = pd.merge(s1, s2[cols_to_merge_s2], on="sample_id", how="inner")
+    # Expert columns are the features for Stage 3
+    expert_cols = [c for c in df_s2.columns if c.startswith("pred_residual_")]
     
-    if 'project_id_x' in df.columns: df.rename(columns={'project_id_x': 'project_id'}, inplace=True)
-    if "Tissue" not in df.columns and "tissue" in df.columns: df.rename(columns={'tissue': 'Tissue'}, inplace=True)
-
-    # 2. Feature Engineering
-    df["target_residual"] = df["age"] - df["pred_age"]
-    y = df["target_residual"].values
+    # Merge based on sample_id
+    df = pd.merge(
+        df_s1[['sample_id', 'age', 'pred_age_stage1', 'Tissue']], 
+        df_s2[['sample_id'] + expert_cols], 
+        on="sample_id"
+    )
     
-    input_features = []
-    for col in expert_cols:
-        if col.startswith("pred_age_"):
-            feat_name = f"diff_{col.replace('pred_age_', '')}"
-            df[feat_name] = df[col] - df["pred_age"]
-            input_features.append(feat_name)
-        else:
-            input_features.append(col)
-            
-    X = df[input_features].values
+    # Target is the residual: True Age - Stage 1 Prediction
+    df["target_residual"] = df["age"] - df["pred_age_stage1"]
+    
+    X = df[expert_cols].values.astype(np.float32)
+    y = df["target_residual"].values.astype(np.float32)
     tissues = df["Tissue"].values
     
-    log(f"Training Ridge Models on {len(input_features)} features.")
-
-    # 3. Tissue-Specific Ridge Regression
     models = {}
-    weights_log = []
     
-    # A. Global Model (Fallback)
-    log("Training Global Ridge Model...")
+    # 1. Global Model (Fallback for small tissue samples)
     global_model = RidgeCV(alphas=alphas, scoring='neg_mean_absolute_error')
     global_model.fit(X, y)
     models['Global'] = global_model
     
-    # B. Tissue-Specific Models
+    # 2. Tissue-Specific Models
     unique_tissues = np.unique(tissues)
-    final_preds = np.zeros(len(y))
-    
-    log(f"Training specific models for {len(unique_tissues)} tissues...")
-    
     for tissue in unique_tissues:
         mask = (tissues == tissue)
-        n_samples = np.sum(mask)
-        
-        if n_samples >= min_samples_for_tissue:
-            X_t = X[mask]
-            y_t = y[mask]
-            
-            # RidgeCV automatically selects the best alpha (Regularization strength)
+        if np.sum(mask) >= min_samples_for_tissue:
             model = RidgeCV(alphas=alphas, scoring='neg_mean_absolute_error')
-            model.fit(X_t, y_t)
-            
-            final_preds[mask] = model.predict(X_t)
+            model.fit(X[mask], y[mask])
             models[tissue] = model
             
-            # Log weights for analysis
-            weights = {k: v for k, v in zip(input_features, model.coef_)}
-            weights['Tissue'] = tissue
-            weights['Intercept'] = model.intercept_
-            weights['Alpha'] = model.alpha_
-            weights['N_Samples'] = n_samples
-            weights_log.append(weights)
-        else:
-            final_preds[mask] = global_model.predict(X[mask])
-
-    # 4. Results
-    final_pred_age = df["pred_age"] + final_preds
-    
-    metrics = compute_regression_metrics(df["age"].values, final_pred_age.values)
-    log(f"📊 Stage 3 (Ridge) Final Results:")
-    log(f"   > MAE: {metrics['MAE']:.4f}")
-    
-    s1_mae = np.mean(np.abs(df["age"] - df["pred_age"]))
-    log(f"   (vs Stage 1 MAE: {s1_mae:.4f})")
-    
-    if weights_log:
-        pd.DataFrame(weights_log).to_csv(os.path.join(output_dir, "Stage3_Ridge_Weights.csv"), index=False)
-    
-    # Save Outputs
+    # Save Model Dictionary and Feature List
     artifact_handler.save_fusion_model(models)
-    artifact_handler.save("stage3_features", input_features)
-    
-    out_df = df[["sample_id", "age", "Tissue", "project_id"]].copy()
-    out_df["Stage1_Pred"] = df["pred_age"]
-    out_df["Stage3_Residual"] = final_preds
-    out_df["HeteroAge"] = final_pred_age
-    out_df["HeteroAge_Accel"] = out_df["HeteroAge"] - out_df["age"]
-    
-    artifact_handler.save_final_predictions(out_df)
-    log(f"✅ Stage 3 Completed. Outputs saved to {output_dir}")
+    artifact_handler.save("stage3_features", expert_cols)
+    log(f"Stage 3 training completed. Features used: {len(expert_cols)}")
 
 def predict_stage3(artifact_dir, input_path, output_path):
-    # Inference logic
+    """
+    Stage 3 Inference: Linear residual fusion to produce final HeteroAge.
+    Calculates both the stage 3 correction and the final age.
+    """
+    log(">>> [Stage 3] Running Residual Fusion Inference...")
+    
+    # 1. Load Artifacts
     artifact_handler = Stage3Artifact(artifact_dir)
-    log(f"Loading Stage 3 Ridge models from {artifact_dir}...")
-    models = artifact_handler.load_fusion_model()
-    features = artifact_handler.load("stage3_features")
+    fusion_models = artifact_handler.load_fusion_model()
+    target_features = artifact_handler.load("stage3_features")
     
-    if input_path.endswith('.csv'): df = pd.read_csv(input_path)
-    else: df = pd.read_pickle(input_path)
+    # 2. Load Consolidated Input Data (Pickle from pipeline)
+    if input_path.endswith('.csv'):
+        df = pd.read_csv(input_path)
+    else:
+        df = pd.read_pickle(input_path)
         
-    if "pred_age_stage1" in df.columns: df["pred_age"] = df["pred_age_stage1"]
-    if "Stage1_Pred" in df.columns: df["pred_age"] = df["Stage1_Pred"]
-    if "Tissue" in df.columns: pass
-    elif "tissue" in df.columns: df.rename(columns={'tissue': 'Tissue'}, inplace=True)
+    # Standardize base age column
+    if "pred_age_stage1" in df.columns:
+        base_age_col = "pred_age_stage1"
+    elif "Stage1_Pred" in df.columns:
+        base_age_col = "Stage1_Pred"
+    else:
+        raise KeyError("Stage 1 prediction column not found in input.")
     
-    for feat in features:
-        if feat.startswith("diff_"):
-            hallmark_col = "pred_age_" + feat.replace("diff_", "")
-            if hallmark_col in df.columns: df[feat] = df[hallmark_col] - df["pred_age"]
-            else: df[feat] = 0 
-        elif feat not in df.columns: df[feat] = 0
-            
-    X = df[features].values
-    tissues = df["Tissue"].values
-    final_preds_res = np.zeros(len(df))
+    # Pad missing expert residuals with 0 if necessary
+    for f in target_features:
+        if f not in df.columns:
+            df[f] = 0.0
+
+    # 3. Perform Prediction for Stage 3 Correction
+    X = df[target_features].values.astype(np.float32)
+    tissues = df["Tissue"].values if "Tissue" in df.columns else np.array(["Global"] * len(df))
+    
+    # This is the "pred_residual_stage3"
+    s3_correction = np.zeros(len(df))
     
     unique_tissues = np.unique(tissues)
     for tissue in unique_tissues:
         mask = (tissues == tissue)
-        X_t = X[mask]
-        model = models.get(tissue, models['Global'])
-        final_preds_res[mask] = model.predict(X_t)
+        # Apply specific model or fallback to global
+        model = fusion_models.get(tissue, fusion_models.get('Global'))
+        if model:
+            s3_correction[mask] = model.predict(X[mask])
+
+    # 4. Integrate Results
+    df["pred_residual_stage3"] = s3_correction
+    df["HeteroAge"] = df[base_age_col] + df["pred_residual_stage3"]
     
-    df["HeteroAge"] = df["pred_age"] + final_preds_res
+    # Define columns for final output
+    # Includes ID, S3 correction, and final result
+    output_cols = ["sample_id", "pred_residual_stage3", "HeteroAge"]
+    
+    # Ensure intermediate stage 1 data is preserved if requested by pipeline
+    if base_age_col in df.columns:
+        output_cols.append(base_age_col)
+
+    # 5. Export Results
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    df.to_csv(output_path, index=False)
-    log(f"Final predictions saved to {output_path}")
+    df[output_cols].to_csv(output_path, index=False)
+    
+    # 6. Memory Cleanup
+    del X, df, fusion_models, target_features, s3_correction
+    gc.collect()
+    log(f"   > Stage 3 inference complete. Saved to: {os.path.basename(output_path)}")

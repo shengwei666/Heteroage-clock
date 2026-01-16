@@ -350,46 +350,99 @@ def train_stage2(
             except Exception as e:
                 log(f"Warning: Failed to clean temp dir {temp_dir}: {e}")
 
-def predict_stage2(artifact_dir: str, input_path: str, output_path: str) -> None:
+def predict_stage2(artifact_dir, mmap_path, meta_path, output_path, all_features):
     """
-    Inference for Stage 2 (Target = Residuals).
+    Perform inference across all Hallmark expert models and output residuals.
+    
+    Args:
+        artifact_dir: Directory containing expert models and feature lists.
+        mmap_path: Path to the binary memmap file storing numeric features.
+        meta_path: Path to the metadata pickle file.
+        output_path: Path to save results (CSV).
+        all_features: Ordered list of all feature names in the memmap.
     """
+    log(">>> [Stage 2] Running Hallmark Expert Inference (Safe Alignment Mode)...")
+
+    # 1. Load metadata to get sample IDs and count
+    meta_df = pd.read_pickle(meta_path)
+    n_samples = len(meta_df)
+    n_features_available = len(all_features)
+    
+    # Map the numeric matrix in read-only mode to save physical memory
+    X_full = np.memmap(mmap_path, dtype='float32', mode='r', shape=(n_samples, n_features_available))
+    
+    # Create a fast mapping from feature names to indices
+    feat_to_idx = {f: i for i, f in enumerate(all_features)}
+    
+    # Initialize output result table with sample_id
+    output_df = pd.DataFrame({"sample_id": meta_df["sample_id"].values})
+    
+    # 2. Search and iterate through all expert models
     artifact_handler = Stage2Artifact(artifact_dir)
-    log(f"Loading input data for Stage 2 from {input_path}...")
+    model_files = sorted(glob.glob(os.path.join(artifact_dir, "stage2_*_expert_model.joblib")))
     
-    if input_path.endswith('.csv'):
-        data = pd.read_csv(input_path)
-    else:
-        data = pd.read_pickle(input_path)
-        
-    output_df = pd.DataFrame()
-    if "sample_id" in data.columns:
-        output_df["sample_id"] = data["sample_id"]
-        
-    model_files = glob.glob(os.path.join(artifact_dir, "stage2_*_expert_model.joblib"))
-    
+    if not model_files:
+        log("   ! Warning: No Stage 2 expert models found in the specified directory.")
+        output_df.to_csv(output_path, index=False)
+        return
+
     for m_file in model_files:
+        # Parse Hallmark name from filename
         basename = os.path.basename(m_file)
-        hallmark_name = basename.replace("stage2_", "").replace("_expert_model.joblib", "")
+        hallmark = basename.replace("stage2_", "").replace("_expert_model.joblib", "")
         
-        model = artifact_handler.load_expert_model(hallmark_name)
-        feat_name = f"stage2_{hallmark_name}_features"
+        log(f"   > Processing Expert: {hallmark}")
+        
         try:
-            feature_cols = artifact_handler.load(feat_name)
-        except FileNotFoundError:
-            continue
-        
-        # Handle missing columns
-        missing = [c for c in feature_cols if c not in data.columns]
-        if missing:
-             for c in missing: data[c] = 0.0
-        
-        X = data[feature_cols].values.astype(np.float32)
-        preds = model.predict(X)
-        
-        # [CRITICAL RESTORATION] Output Name
-        output_df[f"pred_residual_{hallmark_name}"] = preds
-        
+            # Load model and the complete feature list used during its training
+            model = artifact_handler.load_expert_model(hallmark)
+            expert_features = artifact_handler.load(f"stage2_{hallmark}_features")
+            
+            if isinstance(expert_features, pd.Index):
+                expert_features = expert_features.tolist()
+
+            # --- Core: Feature Alignment and Missing Value Handling ---
+            # Expert models (e.g., ElasticNet) require the exact same column count as training.
+            n_expert_feats = len(expert_features)
+            X_input = np.zeros((n_samples, n_expert_feats), dtype=np.float32)
+            
+            # Calculate cross-mapping indices
+            available_indices_in_expert = [] # Positions in model's expected list
+            source_indices_in_mmap = []      # Positions in current data matrix
+            
+            for i, f in enumerate(expert_features):
+                if f in feat_to_idx:
+                    available_indices_in_expert.append(i)
+                    source_indices_in_mmap.append(feat_to_idx[f])
+            
+            if not available_indices_in_expert:
+                log(f"     ! Warning: Required features for [{hallmark}] are completely missing. Padding with 0.")
+                output_df[f"pred_residual_{hallmark}"] = 0.0
+                continue
+            
+            # Fill existing sites into the correct positions of the zero matrix
+            X_input[:, available_indices_in_expert] = X_full[:, source_indices_in_mmap]
+            
+            log(f"     Aligned {len(available_indices_in_expert)}/{n_expert_feats} features.")
+            
+            # Predict residual/correction
+            # The model predicts based on available features even if some are padded with 0
+            preds = model.predict(X_input)
+            output_df[f"pred_residual_{hallmark}"] = preds
+            
+            # Immediately clear memory resources for current expert
+            del X_input, model, expert_features
+            gc.collect()
+            
+        except Exception as e:
+            log(f"     ! Error running expert model [{hallmark}]: {e}")
+            output_df[f"pred_residual_{hallmark}"] = 0.0
+
+    # 3. Save aggregated results from all experts
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     output_df.to_csv(output_path, index=False)
-    log(f"Stage 2 predictions saved to {output_path}")
+    
+    # 4. Release memmap handle and dataframes
+    del X_full, meta_df, output_df
+    gc.collect()
+    log(f"   > Stage 2 inference completed. Results saved to: {os.path.basename(output_path)}")
