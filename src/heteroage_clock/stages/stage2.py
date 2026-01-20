@@ -1,448 +1,307 @@
 """
 heteroage_clock.stages.stage2
 
-Stage 2: Hallmark Experts (Parallel Architecture).
-REVERTED TO RESIDUAL PREDICTION STRATEGY.
-
-Strategy:
-- Experts predict the RESIDUAL (Error) of Stage 1, not the absolute age.
-- Target = True Age - Stage 1 Prediction.
-- Goal: Experts specifically focus on what Stage 1 missed (the biological deviation).
-
-[Changes from Route A]:
-1. Target: Residuals (y - y_hat).
-2. Output Columns: 'pred_residual_{hallmark}'.
-3. Streaming: Keeps the memory-efficient disk-based assembly.
+Stage 2: Hallmark Experts (Distributed Optuna Version)
+Function:
+- Trains separate ElasticNet models for each Hallmark using orthogonalized features.
+- Supports distributed hyperparameter optimization via Optuna + SQLite/Journal.
+- Generates Expert OOF predictions for Stage 3 fusion.
+- [Update] Fix: Correctly loads JSON dictionary from Stage 1.
+- [Update] Output now accumulates Stage 1 metadata and adds 'pred_resid_' prefix.
 """
 
 import os
-import glob
-import json
 import gc
-import shutil
+import json
 import joblib
 import pandas as pd
 import numpy as np
 from sklearn.base import clone
-from typing import List, Optional
+from typing import Optional, Dict, Any
 
-from heteroage_clock.core.metrics import compute_regression_metrics
+from heteroage_clock.core.optimization import optimize_elasticnet_optuna
+from heteroage_clock.core.age_transform import AgeTransformer
 from heteroage_clock.core.splits import make_stratified_group_folds
-from heteroage_clock.core.optimization import tune_elasticnet_macro_micro
+from heteroage_clock.core.sampling import adaptive_sampler
 from heteroage_clock.utils.logging import log
 from heteroage_clock.artifacts.stage2 import Stage2Artifact
-from heteroage_clock.core.sampling import adaptive_sampler
 
-# ==============================================================================
-# Helper: Low-Memory Modality Processor (Unchanged)
-# ==============================================================================
-def process_and_dump_modality(name, path, target_samples, output_dir, suffix):
-    """
-    Loads one modality, aligns to target samples, imputes, and dumps to a temp joblib file.
-    Returns: (temp_file_path, feature_names_list)
-    """
-    log(f"  > [Stream] Processing {name} from {path}...")
-    
-    # 1. Load Data
-    df = pd.read_pickle(path)
-    
-    # 2. Standardize Metadata
-    if 'sample_id' not in df.columns:
-        if df.index.name == 'sample_id': df = df.reset_index()
-    df['sample_id'] = df['sample_id'].astype(str)
-    
-    # 3. Align Samples
-    df = df.set_index('sample_id')
-    common_count = len(df.index.intersection(target_samples))
-    log(f"     - Found {common_count}/{len(target_samples)} target samples.")
-    df = df.reindex(target_samples)
-    
-    # 4. Identify Features (Exclude Metadata)
-    meta_cols = {'project_id', 'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy', 'Sex_encoded', 'sample_id', 'sample_key'}
-    
-    # Select ONLY numeric columns first
-    df_numeric = df.select_dtypes(include=[np.number])
-    
-    # Filter out any numeric metadata that might have slipped through
-    features = [c for c in df_numeric.columns if c not in meta_cols]
-    
-    if len(features) < len(df.columns) - len(meta_cols):
-        log(f"     - Note: Filtered out non-numeric columns. Keeping {len(features)} numeric features.")
-    
-    # 5. Rename Features with Suffix
-    feat_map = {}
-    if suffix:
-        for f in features:
-            if not f.endswith(suffix):
-                feat_map[f] = f"{f}{suffix}"
-    
-    if feat_map:
-        df.rename(columns=feat_map, inplace=True)
-        features = [feat_map.get(f, f) for f in features]
-        
-    # 6. Extract & Impute (In-Memory for single modality)
-    log(f"     - Extracting {len(features)} features...")
-    
-    # Use df[features] which strictly contains only numeric columns
-    X_mod = df[features].values.astype(np.float32)
-    
-    # Free memory immediately
-    del df, df_numeric
-    gc.collect()
-    
-    # Fast Imputation (Median)
-    if np.isnan(X_mod).any():
-        log(f"     - Imputing missing values (Median)...")
-        col_medians = np.nanmedian(X_mod, axis=0)
-        inds = np.where(np.isnan(X_mod))
-        X_mod[inds] = np.take(col_medians, inds[1])
-        X_mod = np.nan_to_num(X_mod, nan=0.0)
-    
-    # 7. Dump to Disk
-    temp_path = os.path.join(output_dir, f"temp_{name}.joblib")
-    joblib.dump(X_mod, temp_path)
-    
-    del X_mod
-    gc.collect()
-    
-    return temp_path, features
-
-# ==============================================================================
-# Main Training Function (Reverted to Residuals)
-# ==============================================================================
 def train_stage2(
-    output_dir: str, 
-    stage1_oof_path: str, 
-    stage1_dict_path: str, 
-    pc_path: str,
-    beta_path: str,
-    chalm_path: str,
-    camda_path: str,
-    # Hyperparameters (Optimized for Residuals: Smaller Alphas)
-    alpha_start: float = -5.0,     # Finer search for smaller residuals
-    alpha_end: float = 0.0,        # Upper bound usually lower for residuals
-    n_alphas: int = 50,
-    l1_ratio: float = 0.5,
-    alphas: Optional[List[float]] = None,
-    l1_ratios: Optional[List[float]] = None,
-    n_jobs: int = -1,
+    output_dir: str,
+    stage1_dir: str,
+    mmap_path: str,
+    # --- Optuna & Search Configuration ---
+    n_trials: int = 50,
+    n_jobs: int = 1,
     n_splits: int = 5,
     seed: int = 42,
-    max_iter: int = 5000,
-    # Intelligent Sampling Params
-    min_cohorts: int = 1,
-    min_cap: int = 30,
-    max_cap: int = 500,
-    median_mult: float = 1.0,
-    **kwargs 
+    max_iter: int = 2000,
+    min_cohorts: int = 2,
+    # Search Ranges
+    min_cap_low: int = 10, min_cap_high: int = 60,
+    max_cap_low: int = 200, max_cap_high: int = 1000,
+    median_mult_low: float = 0.5, median_mult_high: float = 2.5,
+    alpha_low: float = 1e-4, alpha_high: float = 1.0,
+    l1_low: float = 0.0, l1_high: float = 1.0,
+    # Distributed Config
+    storage: Optional[str] = None,
+    study_name: Optional[str] = None,
+    **kwargs
 ) -> None:
     """
-    Train Stage 2 Expert Models using Disk-Based Streaming Assembly.
-    Strategy: Residual Prediction (Target = Age - Stage1_Pred).
+    Train Hallmark Expert models using distributed Optuna optimization.
     """
     artifact_handler = Stage2Artifact(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
-    log("=========================================================")
-    log(" STAGE 2: Hallmark Experts (Parallel Architecture)")
-    log(" Strategy: Residual Prediction (Target = True Age - Stage 1)")
-    log("=========================================================")
+    # --- 1. Load Resources from Stage 1 ---
+    log("Loading Stage 1 artifacts...")
     
-    # --- 1. Load Metadata & Target (Stage 1 OOF) ---
-    log(f"Loading Stage 1 OOF from {stage1_oof_path}...")
-    stage1_oof = pd.read_csv(stage1_oof_path)
+    # Load Feature List
+    stage1_features_path = os.path.join(stage1_dir, "stage1_features.pkl")
+    if not os.path.exists(stage1_features_path):
+        stage1_features_path = os.path.join(stage1_dir, "stage1_features_list.pkl")
+    stage1_features = joblib.load(stage1_features_path)
     
-    # Standardize columns
-    col_map = {}
-    if 'Age' in stage1_oof.columns: col_map['Age'] = 'age'
-    if 'Stage1_Pred' in stage1_oof.columns: col_map['Stage1_Pred'] = 'pred_age'
-    if col_map:
-        stage1_oof.rename(columns=col_map, inplace=True)
+    # [FIX] Load Orthogonalized Dictionary (Handle JSON format)
+    # Check for JSON first (Current Standard)
+    json_path = os.path.join(stage1_dir, "Stage1_Orthogonalized_Hallmark_Dict.json")
+    pkl_path = os.path.join(stage1_dir, "stage1_orthogonalized_dict.pkl")
+    
+    if os.path.exists(json_path):
+        log(f"Loading dictionary from JSON: {json_path}")
+        with open(json_path, 'r') as f:
+            ortho_dict = json.load(f)
+    elif os.path.exists(pkl_path):
+        log(f"Loading dictionary from Pickle: {pkl_path}")
+        ortho_dict = joblib.load(pkl_path)
+    else:
+        raise FileNotFoundError(
+            f"Could not find Hallmark Dict in {stage1_dir}. \n"
+            f"Expected {json_path} OR {pkl_path}"
+        )
+    
+    # Load Stage 1 OOF to get Targets and Metadata alignment
+    oof_path = os.path.join(stage1_dir, "Stage1_Global_Anchor_OOF.csv")
+    stage1_oof = pd.read_csv(oof_path)
+    
+    # Ensure strict alignment
+    target_samples = stage1_oof['sample_id'].astype(str).values
+    y = stage1_oof['age'].values.astype(np.float32)
+    groups = stage1_oof['project_id']
+    tissues = stage1_oof['Tissue']
+    
+    # --- 2. Setup Memmap Access ---
+    n_samples = len(target_samples)
+    n_features = len(stage1_features)
+    
+    if not os.path.exists(mmap_path):
+        raise FileNotFoundError(f"Memmap not found at {mmap_path}. Stage 1 must finish first.")
         
-    if 'age' not in stage1_oof.columns or 'pred_age' not in stage1_oof.columns:
-        raise ValueError(f"Stage 1 OOF missing 'age' or 'pred_age' columns.")
-        
-    # [CRITICAL RESTORATION] Target is Residual
-    # We want experts to predict the ERROR of Stage 1
-    stage1_oof['target_residual'] = stage1_oof['age'] - stage1_oof['pred_age']
+    log(f"Mapping data matrix: {n_samples} samples x {n_features} features")
+    X_full = np.memmap(mmap_path, dtype='float32', mode='r', shape=(n_samples, n_features))
     
-    stage1_oof['sample_id'] = stage1_oof['sample_id'].astype(str)
+    feat_to_idx = {f: i for i, f in enumerate(stage1_features)}
     
-    # Determine valid target samples (Sorted for alignment)
-    target_samples = sorted(stage1_oof['sample_id'].unique())
-    log(f"Stage 2 Target Samples: {len(target_samples)}")
+    # --- 3. Iterate Hallmarks ---
+    hallmark_models = {}
+    oof_preds_dict = {}
     
-    # Align OOF to target_samples strictly
-    stage1_oof = stage1_oof.set_index('sample_id').reindex(target_samples).reset_index()
+    trans = AgeTransformer(adult_age=20)
+    y_trans = trans.transform(y)
+    
+    hallmarks = sorted(ortho_dict.keys())
+    log(f"Starting training for {len(hallmarks)} Hallmarks...")
+    
+    search_config = {
+        'min_cap_low': min_cap_low, 'min_cap_high': min_cap_high,
+        'max_cap_low': max_cap_low, 'max_cap_high': max_cap_high,
+        'median_mult_low': median_mult_low, 'median_mult_high': median_mult_high,
+        'alpha_low': alpha_low, 'alpha_high': alpha_high,
+        'l1_low': l1_low, 'l1_high': l1_high
+    }
 
-    # Define Target Vector (Residuals)
-    y_global = stage1_oof['target_residual'].values.astype(np.float32)
-    log(f"Target defined: Residuals (Range: {y_global.min():.2f} to {y_global.max():.2f})")
-
-    log(f"Loading Hallmark Dictionary from {stage1_dict_path}...")
-    if not os.path.exists(stage1_dict_path): 
-        raise FileNotFoundError(stage1_dict_path)
-    
-    with open(stage1_dict_path, 'r') as f:
-        hallmark_dict = json.load(f)
-
-    # --- 2. Stream Process Modalities (Build X) ---
-    # (Same memory-efficient loading logic)
-    temp_dir = os.path.join(output_dir, "stage2_stream_cache")
-    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir)
-
-    try:
-        # A. Process PCs (Context)
-        log(f"Processing Context (PCs) from {pc_path}...")
-        pc_data = pd.read_csv(pc_path)
-        pc_data['sample_id'] = pc_data['sample_id'].astype(str)
-        pc_data = pc_data.set_index('sample_id').reindex(target_samples).reset_index()
-        pc_cols = [c for c in pc_data.columns if c.startswith('RF_PC')]
+    for h_name in hallmarks:
+        feats = ortho_dict[h_name]
         
-        # B. Stream Omics Modalities
-        tasks = [
-            ('beta', beta_path, '_beta'),
-            ('chalm', chalm_path, '_chalm'),
-            ('camda', camda_path, '_camda')
-        ]
-        
-        temp_files = []
-        all_features = []
-        
-        for name, path, suffix in tasks:
-            if path and os.path.exists(path):
-                t_path, feats = process_and_dump_modality(name, path, target_samples, temp_dir, suffix)
-                temp_files.append(t_path)
-                all_features.extend(feats)
-            else:
-                log(f"Warning: Path for {name} not found or empty: {path}")
+        valid_feats = [f for f in feats if f in feat_to_idx]
+        if not valid_feats:
+            log(f"Skipping {h_name} (No matching features found)")
+            continue
             
-        all_features.extend(pc_cols)
+        indices = [feat_to_idx[f] for f in valid_feats]
+        log(f"=== Training Expert: {h_name} ({len(indices)} features) ===")
         
-        # C. Assemble Final Memmap
-        log("Assembling Stage 2 X Matrix on Disk...")
-        n_samples = len(target_samples)
-        n_features = len(all_features)
+        # Slicing Memmap
+        X_sub = X_full[:, indices]
         
-        mm_file = os.path.join(temp_dir, "X_stage2.dat")
-        X_final = np.memmap(mm_file, dtype='float32', mode='w+', shape=(n_samples, n_features))
+        # Unique Study Name for Distributed DB
+        h_study_name = f"{study_name}_{h_name}" if study_name else None
         
-        current_col = 0
+        # A. Optimize with Optuna
+        best_model, _ = optimize_elasticnet_optuna(
+            X=X_sub,
+            y=y_trans,
+            groups=groups,
+            tissues=tissues,
+            output_dir=os.path.join(output_dir, "optuna_logs", h_name),
+            trans_func=trans,
+            n_trials=n_trials,
+            n_jobs=n_jobs,
+            n_splits=n_splits,
+            seed=seed,
+            max_iter=max_iter,
+            min_cohorts=min_cohorts,
+            search_config=search_config,
+            storage=storage,
+            study_name=h_study_name
+        )
         
-        # Write Modalities
-        for t_path in temp_files:
-            log(f"  > Merging {os.path.basename(t_path)}...")
-            X_part = joblib.load(t_path)
-            n_cols = X_part.shape[1]
-            X_final[:, current_col : current_col + n_cols] = X_part
-            current_col += n_cols
-            del X_part
-            gc.collect()
-            
-        # Write PCs
-        log(f"  > Merging PCs...")
-        if len(pc_cols) > 0:
-            X_pc = pc_data[pc_cols].values.astype(np.float32)
-            X_final[:, current_col:] = X_pc
-        
-        X_final.flush()
-        log(f"Stage 2 Data Assembly Complete. Shape: {X_final.shape}")
-        
-        # Switch to Read-Only
-        X_full_mmap = np.memmap(mm_file, dtype='float32', mode='r', shape=(n_samples, n_features))
-        feat_to_idx = {name: i for i, name in enumerate(all_features)}
-
-        # --- 3. Prepare Metadata & Output Container ---
-        group_col = "project_id" if "project_id" in stage1_oof.columns else "project_id_oof"
-        tissue_col = "Tissue" if "Tissue" in stage1_oof.columns else "Tissue_oof"
-        
-        groups = stage1_oof[group_col].copy()
-        tissues = stage1_oof[tissue_col].copy()
-
-        # Output DataFrame
-        stage2_oof_df = stage1_oof[['sample_id', 'age', 'pred_age', tissue_col, group_col, 'target_residual']].copy()
-        stage2_oof_df.rename(columns={
-            'age': 'Age', 
-            'pred_age': 'Stage1_Pred',
-            tissue_col: 'Tissue',
-            group_col: 'project_id',
-            'target_residual': 'True_Residual' # Save the target for checking later
-        }, inplace=True)
-        
-        # --- 4. Train Hallmark Experts Loop ---
+        # B. Generate OOF Predictions
+        log(f"   > Generating OOF for {h_name}...")
         folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
+        oof_preds = np.zeros(len(y), dtype=np.float32)
         
-        for hallmark, feat_list in hallmark_dict.items():
-            hallmark_clean = hallmark.replace("/", "_").replace(" ", "_")
-            log(f"\n>> Processing Hallmark Expert: [{hallmark_clean}] (Target: Residual)")
+        best_sampling = getattr(best_model, 'best_sampling_params_', {})
+
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            # Sampling Setup
+            train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
+            train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
+            df_train_meta = pd.DataFrame({'Tissue': train_tissues, 'project_id': train_groups, 'original_idx': train_idx})
             
-            indices = [feat_to_idx[f] for f in feat_list if f in feat_to_idx]
-            
-            if not indices:
-                log(f"   Warning: No valid features found for {hallmark_clean}. Skipping.")
-                continue
-            
-            X_hallmark = X_full_mmap[:, indices]
-            log(f"   Input shape: {X_hallmark.shape}")
-            
-            # A. Hyperparameter Optimization (Target = Residual)
-            best_model, _ = tune_elasticnet_macro_micro(
-                X=X_hallmark, y=y_global, groups=groups, tissues=tissues, 
-                trans_func=None,
-                alpha_start=alpha_start, alpha_end=alpha_end, n_alphas=n_alphas,
-                l1_ratio=l1_ratio, alphas=alphas, l1_ratios=l1_ratios,
-                n_jobs=n_jobs, n_splits=n_splits, seed=seed, max_iter=max_iter,
-                min_cohorts=min_cohorts, min_cap=min_cap, max_cap=max_cap, median_mult=median_mult
+            df_bal, _ = adaptive_sampler(
+                df_train_meta, 
+                min_coh=min_cohorts, 
+                min_c=best_sampling.get('min_cap', 30), 
+                max_c=best_sampling.get('max_cap', 500), 
+                mult=best_sampling.get('median_mult', 1.0), 
+                seed=seed + fold_idx
             )
+            final_train_idx = df_bal['original_idx'].values
             
-            # B. OOF Predictions
-            hallmark_oof = np.zeros(len(y_global), dtype=np.float32)
+            # Train & Predict Fold
+            m_fold = clone(best_model)
+            m_fold.fit(X_sub[final_train_idx], y_trans[final_train_idx])
+            val_p_trans = m_fold.predict(X_sub[val_idx])
+            oof_preds[val_idx] = trans.inverse_transform(val_p_trans)
             
-            for fold_idx, (train_idx, val_idx) in enumerate(folds):
-                train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
-                train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
-                
-                df_train_meta = pd.DataFrame({'Tissue': train_tissues, 'project_id': train_groups, 'idx': train_idx})
-                df_bal, _ = adaptive_sampler(df_train_meta, min_coh=min_cohorts, min_c=min_cap, max_c=max_cap, mult=median_mult, seed=seed + fold_idx)
-                final_train_idx = df_bal['idx'].values
-                
-                m = clone(best_model)
-                m.fit(X_hallmark[final_train_idx], y_global[final_train_idx])
-                hallmark_oof[val_idx] = m.predict(X_hallmark[val_idx])
-                
-            # [CRITICAL RESTORATION] Output Name: pred_residual_{hallmark}
-            col_name = f"pred_residual_{hallmark_clean}"
-            stage2_oof_df[col_name] = hallmark_oof
-            
-            # Metrics (MAE on Residuals - closer to 0 is better fit to the ERROR)
-            # R2 here means "How much of the Stage 1 Error can we explain?"
-            metrics = compute_regression_metrics(y_global, hallmark_oof)
-            log(f"   > {hallmark_clean} Residual R2: {metrics.get('R2', 0.0):.4f} | MAE: {metrics.get('MAE', 0.0):.4f}")
-            
-            # C. Final Model Training
-            df_full_meta = pd.DataFrame({'Tissue': tissues, 'project_id': groups, 'idx': np.arange(len(y_global))})
-            df_full_bal, _ = adaptive_sampler(df_full_meta, min_cohorts, min_cap, max_cap, median_mult, seed)
-            final_idx = df_full_bal['idx'].values
-            
-            final_model = clone(best_model)
-            final_model.fit(X_hallmark[final_idx], y_global[final_idx])
-            
-            used_features = [all_features[i] for i in indices]
-            artifact_handler.save_expert_model(hallmark_clean, final_model)
-            artifact_handler.save(f"stage2_{hallmark_clean}_features", used_features)
+        # Use prefix for easier Stage 3 identification
+        oof_preds_dict[f"pred_resid_{h_name}"] = oof_preds
+        
+        # C. Retrain Final Model on Full Data
+        log(f"   > Retraining final model for {h_name}...")
+        df_full_meta = pd.DataFrame({'Tissue': tissues, 'project_id': groups, 'original_idx': np.arange(len(y))})
+        df_full_bal, _ = adaptive_sampler(
+            df_full_meta, 
+            min_coh=min_cohorts, 
+            min_c=best_sampling.get('min_cap', 30), 
+            max_c=best_sampling.get('max_cap', 500), 
+            mult=best_sampling.get('median_mult', 1.0), 
+            seed=seed
+        )
+        final_idx = df_full_bal['original_idx'].values
+        
+        final_model = clone(best_model)
+        final_model.fit(X_sub[final_idx], y_trans[final_idx])
+        final_model.feature_names_ = valid_feats
+        hallmark_models[h_name] = final_model
+        
+        del X_sub
+        import gc
+        gc.collect()
 
-            del X_hallmark, m, final_model
-            gc.collect()
-
-        # Save Final CSV
-        artifact_handler.save_oof_corrections(stage2_oof_df)
-        log(f"✅ Stage 2 Completed. Predictions saved to: {os.path.join(output_dir, 'Stage2_Hallmark_OOF.csv')}") # Updated filename
-
-    finally:
-        if os.path.exists(temp_dir):
-            try:
-                if 'X_full_mmap' in locals(): del X_full_mmap
-                if 'X_final' in locals(): del X_final
-                gc.collect()
-                shutil.rmtree(temp_dir)
-                log(f"Cleaned up Stage 2 temp memmap: {temp_dir}")
-            except Exception as e:
-                log(f"Warning: Failed to clean temp dir {temp_dir}: {e}")
-
-def predict_stage2(artifact_dir, mmap_path, meta_path, output_path, all_features):
-    """
-    Perform inference across all Hallmark expert models and output residuals.
+    # --- 4. Save Artifacts (Cumulative) ---
+    log("Saving Stage 2 Artifacts...")
     
-    Args:
-        artifact_dir: Directory containing expert models and feature lists.
-        mmap_path: Path to the binary memmap file storing numeric features.
-        meta_path: Path to the metadata pickle file.
-        output_path: Path to save results (CSV).
-        all_features: Ordered list of all feature names in the memmap.
-    """
-    log(">>> [Stage 2] Running Hallmark Expert Inference (Safe Alignment Mode)...")
+    # Save Models
+    artifact_handler.save_expert_models(hallmark_models)
+    
+    # Save Cumulative OOF (S1 + S2)
+    final_oof_df = stage1_oof.copy()
+    
+    for col_name, preds in oof_preds_dict.items():
+        final_oof_df[col_name] = preds
+    
+    artifact_handler.save_oof_predictions(final_oof_df)
+    
+    del X_full
+    gc.collect()
+    
+    log(f"Stage 2 Complete. Models saved to {output_dir}")
 
-    # 1. Load metadata to get sample IDs and count
+
+def predict_stage2(
+    artifact_dir: str, 
+    stage1_dir: str, 
+    mmap_path: str, 
+    meta_path: str, 
+    output_path: str
+) -> None:
+    """
+    Inference for Stage 2. Loads Hallmark models and predicts on new data.
+    """
+    log(">>> [Stage 2] Running Hallmark Experts Prediction...")
+    
+    # 1. Load Artifacts
+    artifact_handler = Stage2Artifact(artifact_dir)
+    hallmark_models = artifact_handler.load_expert_models()
+    
+    stage1_features_path = os.path.join(stage1_dir, "stage1_features.pkl")
+    if not os.path.exists(stage1_features_path):
+         stage1_features_path = os.path.join(stage1_dir, "stage1_features_list.pkl")
+    stage1_features = joblib.load(stage1_features_path)
+    
+    # 2. Setup Data Access
     meta_df = pd.read_pickle(meta_path)
     n_samples = len(meta_df)
-    n_features_available = len(all_features)
+    n_features = len(stage1_features)
     
-    # Map the numeric matrix in read-only mode to save physical memory
-    X_full = np.memmap(mmap_path, dtype='float32', mode='r', shape=(n_samples, n_features_available))
+    feat_to_idx = {f: i for i, f in enumerate(stage1_features)}
     
-    # Create a fast mapping from feature names to indices
-    feat_to_idx = {f: i for i, f in enumerate(all_features)}
+    log(f"Mapping data matrix for inference: {n_samples}x{n_features}")
+    X_full = np.memmap(mmap_path, dtype='float32', mode='r', shape=(n_samples, n_features))
     
-    # Initialize output result table with sample_id
-    output_df = pd.DataFrame({"sample_id": meta_df["sample_id"].values})
+    trans = AgeTransformer(adult_age=20)
     
-    # 2. Search and iterate through all expert models
-    artifact_handler = Stage2Artifact(artifact_dir)
-    model_files = sorted(glob.glob(os.path.join(artifact_dir, "stage2_*_expert_model.joblib")))
+    # 3. Predict per Hallmark
+    results = {}
+    results["sample_id"] = meta_df["sample_id"].values
     
-    if not model_files:
-        log("   ! Warning: No Stage 2 expert models found in the specified directory.")
-        output_df.to_csv(output_path, index=False)
-        return
-
-    for m_file in model_files:
-        # Parse Hallmark name from filename
-        basename = os.path.basename(m_file)
-        hallmark = basename.replace("stage2_", "").replace("_expert_model.joblib", "")
+    for h_name, model in hallmark_models.items():
+        log(f"   > Predicting {h_name}...")
         
-        log(f"   > Processing Expert: {hallmark}")
+        if hasattr(model, "feature_names_"):
+            required_feats = model.feature_names_
+        else:
+            log(f"Warning: Model for {h_name} lacks feature names. Skipping.")
+            continue
+            
+        indices = [feat_to_idx[f] for f in required_feats if f in feat_to_idx]
         
-        try:
-            # Load model and the complete feature list used during its training
-            model = artifact_handler.load_expert_model(hallmark)
-            expert_features = artifact_handler.load(f"stage2_{hallmark}_features")
+        # Slice Data
+        X_sub = X_full[:, indices]
+        
+        # Batched Prediction
+        batch_size = 4096
+        preds_trans = np.zeros(n_samples, dtype=np.float32)
+        
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            X_batch = X_sub[start:end]
+            preds_trans[start:end] = model.predict(X_batch)
             
-            if isinstance(expert_features, pd.Index):
-                expert_features = expert_features.tolist()
-
-            # --- Core: Feature Alignment and Missing Value Handling ---
-            # Expert models (e.g., ElasticNet) require the exact same column count as training.
-            n_expert_feats = len(expert_features)
-            X_input = np.zeros((n_samples, n_expert_feats), dtype=np.float32)
-            
-            # Calculate cross-mapping indices
-            available_indices_in_expert = [] # Positions in model's expected list
-            source_indices_in_mmap = []      # Positions in current data matrix
-            
-            for i, f in enumerate(expert_features):
-                if f in feat_to_idx:
-                    available_indices_in_expert.append(i)
-                    source_indices_in_mmap.append(feat_to_idx[f])
-            
-            if not available_indices_in_expert:
-                log(f"     ! Warning: Required features for [{hallmark}] are completely missing. Padding with 0.")
-                output_df[f"pred_residual_{hallmark}"] = 0.0
-                continue
-            
-            # Fill existing sites into the correct positions of the zero matrix
-            X_input[:, available_indices_in_expert] = X_full[:, source_indices_in_mmap]
-            
-            log(f"     Aligned {len(available_indices_in_expert)}/{n_expert_feats} features.")
-            
-            # Predict residual/correction
-            # The model predicts based on available features even if some are padded with 0
-            preds = model.predict(X_input)
-            output_df[f"pred_residual_{hallmark}"] = preds
-            
-            # Immediately clear memory resources for current expert
-            del X_input, model, expert_features
-            gc.collect()
-            
-        except Exception as e:
-            log(f"     ! Error running expert model [{hallmark}]: {e}")
-            output_df[f"pred_residual_{hallmark}"] = 0.0
-
-    # 3. Save aggregated results from all experts
+        # Inverse Transform
+        results[f"pred_resid_{h_name}"] = trans.inverse_transform(preds_trans)
+        
+        del X_sub
+        gc.collect()
+        
+    # 4. Save Results
+    res_df = pd.DataFrame(results)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    output_df.to_csv(output_path, index=False)
+    res_df.to_csv(output_path, index=False)
     
-    # 4. Release memmap handle and dataframes
-    del X_full, meta_df, output_df
+    del X_full
     gc.collect()
-    log(f"   > Stage 2 inference completed. Results saved to: {os.path.basename(output_path)}")
+    log(f"Stage 2 Prediction saved to {output_path}")

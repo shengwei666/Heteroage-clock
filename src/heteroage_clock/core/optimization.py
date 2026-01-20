@@ -1,219 +1,137 @@
-"""
-heteroage_clock.core.optimization
-
-Hyperparameter optimization routines.
-Updates:
-- Added real-time logging (MAE, MedAE).
-- [Critical] Added batched prediction to prevent OOM when using Memmap data.
-"""
-
-import numpy as np
+import optuna
 import pandas as pd
+import numpy as np
 from sklearn.linear_model import ElasticNet
-from sklearn.metrics import mean_absolute_error, median_absolute_error
-from joblib import Parallel, delayed
-from heteroage_clock.core.splits import make_stratified_group_folds
-from heteroage_clock.core.sampling import adaptive_sampler
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import mean_absolute_error
+from sklearn.base import clone
+from typing import Optional, Tuple, Dict, Any
+# [核心修改 1] 引入 JournalStorage 模块
+from optuna.storages import JournalStorage, JournalFileStorage
+
 from heteroage_clock.utils.logging import log
-from typing import Optional, Any, List, Union, Tuple
+from heteroage_clock.core.sampling import adaptive_sampler
 
-def _batched_predict(model, X, indices, batch_size=2048):
+def optimize_elasticnet_optuna(
+    X: np.memmap,
+    y: np.ndarray,
+    groups: pd.Series,
+    tissues: pd.Series,
+    output_dir: str,
+    trans_func: Any,
+    n_trials: int = 100,
+    n_jobs: int = 1,
+    n_splits: int = 5,
+    seed: int = 42,
+    max_iter: int = 1000,
+    min_cohorts: int = 2,
+    search_config: Optional[Dict] = None,
+    storage: Optional[str] = None,
+    study_name: Optional[str] = None
+) -> Tuple[Any, pd.DataFrame]:
     """
-    Helper to predict in chunks.
-    This is crucial when X is a memmap, to avoid loading the entire validation set (X[indices]) into RAM at once.
-    
-    Args:
-        model: Trained sklearn estimator.
-        X: The full feature matrix (can be Memmap).
-        indices: Array of indices to predict on.
-        batch_size: Size of chunks to read from disk.
-        
-    Returns:
-        np.ndarray: Predictions for the indices.
+    Optimizes ElasticNet using Optuna with distributed support (NFS-Safe Journal Mode).
     """
-    n_samples = len(indices)
-    preds = np.zeros(n_samples, dtype=np.float32)
-    
-    for start in range(0, n_samples, batch_size):
-        end = min(start + batch_size, n_samples)
-        batch_idx = indices[start:end]
-        
-        # X[batch_idx] reads only 'batch_size' rows from disk to RAM
-        # This keeps memory footprint tiny (e.g. <100MB instead of 10GB)
-        batch_preds = model.predict(X[batch_idx])
-        
-        preds[start:end] = batch_preds
-        
-    return preds
+    if search_config is None:
+        search_config = {}
 
-def _evaluate_config(
-    alpha: float, 
-    l1: float, 
-    X, y, 
-    groups, 
-    tissues, 
-    folds, 
-    trans_func, 
-    seed, 
-    search_max_iter,
-    sampling_params: dict = None
-) -> dict:
-    """
-    Internal helper: Evaluates a single alpha/l1 configuration.
-    """
-    oof_preds = np.zeros(len(y), dtype=np.float32)
-    fold_corrs = []
-    
-    model = ElasticNet(alpha=alpha, l1_ratio=l1, random_state=seed, max_iter=search_max_iter)
-    
-    for fold_idx, (train_idx, val_idx) in enumerate(folds):
-        # --- Intelligent Down-sampling (Training Set Only) ---
-        if sampling_params:
+    # Define the objective function
+    def objective(trial):
+        # 1. Hyperparameters
+        alpha = trial.suggest_float("alpha", search_config.get('alpha_low', 1e-4), search_config.get('alpha_high', 1.0), log=True)
+        l1_ratio = trial.suggest_float("l1_ratio", search_config.get('l1_low', 0.1), search_config.get('l1_high', 1.0))
+        
+        # 2. Sampling Parameters
+        min_cap = trial.suggest_int("min_cap", search_config.get('min_cap_low', 10), search_config.get('min_cap_high', 60))
+        max_cap = trial.suggest_int("max_cap", search_config.get('max_cap_low', 200), search_config.get('max_cap_high', 1000))
+        median_mult = trial.suggest_float("median_mult", search_config.get('median_mult_low', 0.5), search_config.get('median_mult_high', 2.5))
+        
+        trial.set_user_attr("min_cap", min_cap)
+        trial.set_user_attr("max_cap", max_cap)
+        trial.set_user_attr("median_mult", median_mult)
+
+        # 3. Cross-Validation Loop
+        cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        mae_scores = []
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, tissues, groups)):
+            # Adaptive Sampling
             train_tissues = tissues.iloc[train_idx].values if hasattr(tissues, 'iloc') else tissues[train_idx]
             train_groups = groups.iloc[train_idx].values if hasattr(groups, 'iloc') else groups[train_idx]
             
-            df_train_meta = pd.DataFrame({
-                'Tissue': train_tissues,
-                'project_id': train_groups,
-                'original_idx': train_idx 
-            })
-            
+            df_meta_train = pd.DataFrame({'Tissue': train_tissues, 'project_id': train_groups, 'original_idx': train_idx})
             df_bal, _ = adaptive_sampler(
-                df_train_meta, 
-                min_coh=sampling_params.get('min_cohorts', 1),
-                min_c=sampling_params.get('min_cap', 30),
-                max_c=sampling_params.get('max_cap', 500),
-                mult=sampling_params.get('median_mult', 1.0),
-                seed=seed + fold_idx 
+                df_meta_train, 
+                min_coh=min_cohorts, 
+                min_c=min_cap, 
+                max_c=max_cap, 
+                mult=median_mult, 
+                seed=seed + fold_idx
             )
             final_train_idx = df_bal['original_idx'].values
-        else:
-            final_train_idx = train_idx
-
-        # Train: X[final_train_idx] is small (downsampled), so memory usage is low.
-        # Even if X is memmap, we load this subset into RAM for training efficiency.
-        model.fit(X[final_train_idx], y[final_train_idx])
-        
-        # Predict: Val set is LARGE. Use batching to keep memory low.
-        # Using model.predict(X[val_idx]) directly would load HUGE data into RAM and crash.
-        pred = _batched_predict(model, X, val_idx, batch_size=2048)
-        
-        # Inverse transform for evaluation (if AgeTransformer is used)
-        pred_eval = trans_func.inverse_transform(pred) if trans_func else pred
-        y_val_eval = trans_func.inverse_transform(y[val_idx]) if trans_func else y[val_idx]
-        
-        oof_preds[val_idx] = pred_eval
-        
-        # Fold Correlation
-        if np.std(pred_eval) > 1e-9 and np.std(y_val_eval) > 1e-9:
-            fold_corrs.append(np.corrcoef(y_val_eval, pred_eval)[0, 1])
-        else:
-            fold_corrs.append(0.0)
             
-    # --- Compute Comprehensive Metrics ---
-    macro_r = np.mean(fold_corrs)
-    
-    y_eval_all = trans_func.inverse_transform(y) if trans_func else y
-    
-    if np.std(oof_preds) > 1e-9:
-        micro_r = np.corrcoef(y_eval_all, oof_preds)[0, 1]
-    else:
-        micro_r = 0.0
-        
-    mae = mean_absolute_error(y_eval_all, oof_preds)
-    med_ae = median_absolute_error(y_eval_all, oof_preds)
-    score = micro_r + macro_r
-    
-    # Real-time Logging
-    print(f"  [Evaluate] Alpha={alpha:.5f} L1={l1:.2f} | Score={score:.4f} (MicroR={micro_r:.3f}, MacroR={macro_r:.3f}) MAE={mae:.3f} MedAE={med_ae:.3f}")
+            # Model Training
+            model = ElasticNet(
+                alpha=alpha, l1_ratio=l1_ratio, random_state=seed, max_iter=max_iter, selection='random'
+            )
+            model.fit(X[final_train_idx], y[final_train_idx])
+            
+            # Predict & Evaluate
+            preds_trans = model.predict(X[val_idx])
+            preds_age = trans_func.inverse_transform(preds_trans)
+            true_age = trans_func.inverse_transform(y[val_idx])
+            
+            mae = mean_absolute_error(true_age, preds_age)
+            mae_scores.append(mae)
+            
+            trial.report(mae, fold_idx)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
 
-    return {
-        "alpha": alpha,
-        "l1_ratio": l1,
-        "score": score,
-        "micro_r": micro_r,
-        "macro_r": macro_r,
-        "mae": mae,
-        "median_ae": med_ae
-    }
+        return np.mean(mae_scores)
 
-def tune_elasticnet_macro_micro(
-    X, # Accepts Memmap or Array
-    y: np.ndarray, 
-    groups: Any, 
-    tissues: Any, 
-    trans_func: Optional[Any] = None, 
-    alphas: Optional[List[float]] = None,
-    alpha_start: float = -4.0,
-    alpha_end: float = -0.5,
-    n_alphas: int = 30,
-    l1_ratios: Optional[List[float]] = None,
-    l1_ratio: float = 0.5,
-    n_jobs: int = -1,
-    n_splits: int = 5,
-    seed: int = 42,
-    max_iter: int = 2000,
-    min_cohorts: int = 1,
-    min_cap: int = 30,
-    max_cap: int = 500,
-    median_mult: float = 1.0
-) -> Tuple[ElasticNet, pd.DataFrame]:
-    """
-    Grid search for best ElasticNet using Macro+Micro correlation score.
-    Returns: (best_model, results_dataframe)
-    """
-    if alphas is None:
-        alphas = np.logspace(alpha_start, alpha_end, n_alphas).tolist()
-    if l1_ratios is None:
-        l1_ratios = [l1_ratio]
-    
-    folds = make_stratified_group_folds(groups=groups, tissues=tissues, n_splits=n_splits, seed=seed)
-    
-    if not folds:
-        log("Warning: Split failed in optimization. Returning default model.")
-        return ElasticNet(alpha=alphas[0] if alphas else 0.01, l1_ratio=l1_ratios[0], random_state=seed), pd.DataFrame()
+    # --- [核心修改 2] 智能判断存储后端 ---
+    if storage and study_name:
+        if storage.startswith("sqlite") or storage.startswith("mysql") or storage.startswith("postgresql"):
+            # 传统数据库模式 (SQLAlchemy)
+            log(f"Using RDB Storage: {storage}")
+            storage_backend = storage
+        else:
+            # 文件日志模式 (JournalStorage) - 专治 NFS 报错
+            log(f"Using NFS-Safe Journal Storage: {storage}")
+            storage_backend = JournalStorage(JournalFileStorage(storage))
 
-    sampling_params = {
-        'min_cohorts': min_cohorts,
-        'min_cap': min_cap,
-        'max_cap': max_cap,
-        'median_mult': median_mult
-    }
-    
-    if max_cap < 100000:
-        log(f"Optimization Strategy: Intelligent Down-sampling Active {sampling_params}")
-    else:
-        log("Optimization Strategy: Full Sampling")
-
-    param_grid = [(a, l) for a in alphas for l in l1_ratios]
-    log(f"Starting Grid Search: {len(param_grid)} configurations using {n_jobs} jobs...")
-    
-    search_max_iter = max(1000, max_iter // 2)
-
-    # Run Parallel Search
-    # Joblib efficiently handles Memmap objects passed as 'X' here.
-    # Note: X is passed to subprocesses. Since it's memmap, no copying happens.
-    results_list = Parallel(n_jobs=n_jobs, verbose=10)(
-        delayed(_evaluate_config)(
-            a, l, X, y, groups, tissues, folds, trans_func, seed, search_max_iter, sampling_params
+        study = optuna.create_study(
+            direction="minimize",
+            storage=storage_backend, # 传入对象而不是字符串
+            study_name=study_name,
+            load_if_exists=True
         )
-        for a, l in param_grid
+    else:
+        log("Creating in-memory study (Single process mode)")
+        study = optuna.create_study(direction="minimize")
+
+    # Run Optimization
+    log(f"Starting optimization loop for {n_trials} trials...")
+    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
+
+    log("Optimization finished.")
+    log(f"Best Trial: {study.best_trial.params}")
+    log(f"Best MAE: {study.best_value}")
+
+    # Retrain Best Model
+    best_params = study.best_trial.params
+    best_model = ElasticNet(
+        alpha=best_params['alpha'],
+        l1_ratio=best_params['l1_ratio'],
+        random_state=seed,
+        max_iter=max_iter
     )
-    
-    # Convert to DataFrame
-    df_results = pd.DataFrame(results_list)
-    
-    # Sort by Score (descending)
-    df_results = df_results.sort_values(by="score", ascending=False).reset_index(drop=True)
-    
-    # Select Best
-    best_row = df_results.iloc[0]
-    best_alpha = best_row['alpha']
-    best_l1 = best_row['l1_ratio']
-    best_score = best_row['score']
-    
-    log(f"  > Best Result: Alpha={best_alpha:.5f}, L1={best_l1:.2f}, Score={best_score:.4f}, MAE={best_row['mae']:.4f}, MedAE={best_row['median_ae']:.4f}")
-    
-    best_model = ElasticNet(alpha=best_alpha, l1_ratio=best_l1, random_state=seed, max_iter=max_iter)
-    
-    return best_model, df_results
+    best_model.best_sampling_params_ = {
+        'min_cap': best_params['min_cap'],
+        'max_cap': best_params['max_cap'],
+        'median_mult': best_params['median_mult']
+    }
+
+    trials_df = study.trials_dataframe()
+    return best_model, trials_df

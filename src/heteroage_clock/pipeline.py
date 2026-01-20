@@ -1,170 +1,259 @@
 """
 heteroage_clock.pipeline
-Coordinating the 3-Stage Training and Inference.
-Updated: Extended memory-saving strategies (Selective Loading, Float32, GC) to inference.
+
+End-to-end Prediction Pipeline.
+Updates:
+- [Critical] Implements 'InferenceDataAssembler' to build the mandatory Memmap for Stage 1 & 2.
+- [Feature] Orchestrates the new explicit-path inference flow.
+- [Optimization] Memory-safe handling of multi-modal inputs via chunked processing.
 """
 
 import os
-import pandas as pd
-import numpy as np
+import shutil
 import gc
 import joblib
+import pandas as pd
+import numpy as np
+from typing import List, Optional
+
+# Import prediction functions from specific stages
+from heteroage_clock.stages.stage1 import predict_stage1
+from heteroage_clock.stages.stage2 import predict_stage2
+from heteroage_clock.stages.stage3 import predict_stage3
+from heteroage_clock.artifacts.stage1 import Stage1Artifact
 from heteroage_clock.utils.logging import log
-from heteroage_clock.stages.stage1 import train_stage1, predict_stage1
-from heteroage_clock.stages.stage2 import train_stage2, predict_stage2
-from heteroage_clock.stages.stage3 import train_stage3, predict_stage3
 
-def _standardize_ids(df):
-    if 'sample_id' in df.columns:
-        if not df['sample_id'].duplicated().any():
-            return df
-    
-    for col in ['gsm', 'id', 'Unnamed: 0']:
-        if col in df.columns and not df[col].duplicated().any():
-            df = df.rename(columns={col: 'sample_id'})
-            return df
-
-    df = df.copy()
-    df = df.reset_index().rename(columns={df.index.name if df.index.name else 'index': 'sample_id'})
-    df['sample_id'] = df['sample_id'].astype(str)
-    if df['sample_id'].duplicated().any():
-        df = df.drop_duplicates(subset=['sample_id'], keep='first')
-    return df
-
-def _get_sparse_numeric_features(artifact_dir):
-    numeric_features = set()
-    meta_keys = {'sample_id', 'project_id', 'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy'}
-    
-    # Stage 1
-    s1_feat_path = os.path.join(artifact_dir, "stage1", "stage1_features.pkl")
-    if os.path.exists(s1_feat_path):
-        all_s1_feats = joblib.load(s1_feat_path)
-        numeric_features.update([f for f in all_s1_feats if f not in meta_keys])
-
-    # Stage 2
-    s2_dir = os.path.join(artifact_dir, "stage2")
-    if os.path.exists(s2_dir):
-        feat_files = [f for f in os.listdir(s2_dir) if "features.joblib" in f or "features.pkl" in f]
-        for f_file in feat_files:
-            feats = joblib.load(os.path.join(s2_dir, f_file))
-            numeric_features.update([f for f in feats if f not in meta_keys])
-    
-    return sorted(list(numeric_features))
-
-def _merge_to_memmap_sparse(input_path, input_chalm, input_camda, input_pc, output_dir, numeric_features):
-    log("--- Data Assembly: Building Sparse Numeric Matrix ---")
-    raw_main = pd.read_pickle(input_path) if input_path.endswith('.pkl') else pd.read_csv(input_path)
-    main_df = _standardize_ids(raw_main)
-    
-    sample_ids = main_df['sample_id'].astype(str).values
-    X = np.memmap(os.path.join(output_dir, f"inference_{os.getpid()}.mmap"), 
-                  dtype='float32', mode='w+', shape=(len(sample_ids), len(numeric_features)))
-    X[:] = 0.0 
-    
-    feat_to_idx = {f: i for i, f in enumerate(numeric_features)}
-    
-    def fill_modality(path, suffix):
-        if not path or not os.path.exists(path): return
-        log(f"   Streaming modality: {os.path.basename(path)}")
-        data = _standardize_ids(pd.read_pickle(path) if path.endswith('.pkl') else pd.read_csv(path))
-        data = data.set_index('sample_id').reindex(sample_ids)
-        
-        meta_ignore = {'Tissue', 'Age', 'age', 'Sex', 'Is_Healthy', 'sample_id', 'project_id'}
-        rename_map = {c: (c if c.startswith('RF_PC') else f"{c}{suffix}") 
-                      for c in data.columns if c not in meta_ignore}
-        
-        data.rename(columns=rename_map, inplace=True)
-        active_cols = [c for c in data.columns if c in feat_to_idx]
-        if active_cols:
-            target_indices = [feat_to_idx[c] for c in active_cols]
-            X[:, target_indices] = data[active_cols].apply(pd.to_numeric, errors='coerce').fillna(0).values.astype('float32')
-        del data; gc.collect()
-
-    fill_modality(input_path, "_beta")
-    fill_modality(input_chalm, "_chalm")
-    fill_modality(input_camda, "_camda")
-    fill_modality(input_pc, "") 
-    X.flush()
-    
-    # CRITICAL: Preserve 'age' in meta_df for plotting
-    meta_path = os.path.join(output_dir, f"meta_{os.getpid()}.pkl")
-    meta_keys = ['sample_id', 'Tissue', 'Age', 'age', 'Sex', 'project_id', 'Is_Healthy']
-    final_meta_cols = [c for c in meta_keys if c in main_df.columns]
-    main_df[final_meta_cols].to_pickle(meta_path)
-    
-    return X.filename, meta_path
-
-def train_pipeline(output_dir, pc_path, dict_path, beta_path, chalm_path, camda_path, **kwargs):
+class InferenceDataAssembler:
     """
-    Sequentially trains Stage 1, Stage 2, and Stage 3.
+    Responsible for aligning raw input files to the model's feature space
+    and creating a memory-mapped binary file for efficient inference.
     """
-    log("=== Pipeline: Starting Full Training Pipeline ===")
-    
-    s1_dir = os.path.join(output_dir, "stage1")
-    train_stage1(
-        output_dir=s1_dir, pc_path=pc_path, dict_path=dict_path,
-        beta_path=beta_path, chalm_path=chalm_path, camda_path=camda_path, **kwargs
-    )
-    
-    s1_oof = os.path.join(s1_dir, "stage1_oof_predictions.csv")
-    s1_dict = os.path.join(s1_dir, "stage1_orthogonalized_dict.joblib")
-    
-    s2_dir = os.path.join(output_dir, "stage2")
-    train_stage2(
-        output_dir=s2_dir, stage1_oof_path=s1_oof, stage1_dict_path=s1_dict,
-        pc_path=pc_path, beta_path=beta_path, chalm_path=chalm_path, camda_path=camda_path, **kwargs
-    )
-    
-    s2_oof = os.path.join(s2_dir, "stage2_oof_corrections.csv")
-    
-    s3_dir = os.path.join(output_dir, "stage3")
-    train_stage3(
-        output_dir=s3_dir, stage1_oof_path=s1_oof, stage2_oof_path=s2_oof, pc_path=pc_path, **kwargs
-    )
-    log(f"=== Pipeline: Full Training Finished ===")
+    def __init__(self, output_dir: str, feature_names: List[str]):
+        self.output_dir = output_dir
+        self.feature_names = feature_names
+        # Create a fast lookup map: Feature Name -> Column Index
+        self.feat_map = {f: i for i, f in enumerate(feature_names)}
+        self.n_features = len(feature_names)
+        self.mmap_path = os.path.join(output_dir, "X_inference.dat")
+        
+    def assemble(self, main_df: pd.DataFrame, 
+                 chalm_path: Optional[str] = None, 
+                 camda_path: Optional[str] = None, 
+                 pc_path: Optional[str] = None) -> str:
+        """
+        Builds X matrix on disk.
+        Args:
+            main_df: The primary input dataframe (Beta values + Metadata).
+            chalm_path: Path to Chalm pickle/csv.
+            camda_path: Path to Camda pickle/csv.
+            pc_path: Path to PC CSV.
+        Returns:
+            Path to the generated Memmap file.
+        """
+        n_samples = len(main_df)
+        log(f"Assembling Inference Matrix: {n_samples} samples x {self.n_features} features")
+        
+        # 1. Create Writeable Memmap (Initialize with Zeros)
+        # Zeros effectively act as mean-imputation for StandardScaler centered data.
+        X_mmap = np.memmap(self.mmap_path, dtype='float32', mode='w+', shape=(n_samples, self.n_features))
+        
+        # 2. Process Modalities
+        # We enforce the standard suffixes used in training: _beta, _chalm, _camda
+        
+        # --- A. Process Main Input (Beta) ---
+        log("  > Merging Beta modality (from main input)...")
+        self._fill_modality(X_mmap, main_df, suffix="_beta")
+        
+        # --- B. Process Chalm ---
+        if chalm_path and os.path.exists(chalm_path):
+            self._process_file(X_mmap, chalm_path, main_df['sample_id'], suffix="_chalm")
+            
+        # --- C. Process Camda ---
+        if camda_path and os.path.exists(camda_path):
+            self._process_file(X_mmap, camda_path, main_df['sample_id'], suffix="_camda")
+            
+        # --- D. Process PCs ---
+        if pc_path and os.path.exists(pc_path):
+            # PCs usually have exact names (no suffix needed if names match training feature list)
+            self._process_file(X_mmap, pc_path, main_df['sample_id'], suffix="") 
+            
+        # Flush changes to disk
+        X_mmap.flush()
+        # Explicitly delete the memmap object to close the file handle
+        del X_mmap
+        gc.collect()
+        
+        return self.mmap_path
 
-def predict_pipeline(artifact_dir, input_path, output_path, **kwargs):
-    log("=== Pipeline: Starting Full-Output Inference ===")
-    mmap_path, meta_path = None, None
-    s1_out, s2_out, s3_out = [output_path + f".s{i}.csv" for i in [1, 2, 3]]
+    def _process_file(self, X_mmap, path, target_sample_ids, suffix):
+        """Loads a file, aligns samples, and fills the memmap."""
+        log(f"  > Merging modality from {os.path.basename(path)}...")
+        
+        # Load File
+        if path.endswith('.csv'):
+            df = pd.read_csv(path)
+        else:
+            df = pd.read_pickle(path)
+            
+        # Standardize ID column
+        if 'sample_id' not in df.columns and df.index.name == 'sample_id':
+            df = df.reset_index()
+            
+        if 'sample_id' not in df.columns:
+            log(f"Warning: 'sample_id' not found in {os.path.basename(path)}. Skipping merge.")
+            return
+
+        df['sample_id'] = df['sample_id'].astype(str)
+        
+        # Align rows to main_df order (Left Join / Reindex)
+        df = df.set_index('sample_id').reindex(target_sample_ids).reset_index()
+        
+        self._fill_modality(X_mmap, df, suffix)
+        
+        del df
+        gc.collect()
+
+    def _fill_modality(self, X_mmap, df, suffix):
+        """
+        Maps columns from df to X_mmap indices based on feature_names and suffix.
+        Uses chunked assignment to be memory safe.
+        """
+        # 1. Map DF columns to Memmap Indices
+        col_to_idx = {}
+        
+        if suffix:
+            # Check if "ColName" + "Suffix" exists in our feature list
+            for col in df.columns:
+                target_name = f"{col}{suffix}"
+                if target_name in self.feat_map:
+                    col_to_idx[col] = self.feat_map[target_name]
+        else:
+            # Exact match check
+            for col in df.columns:
+                if col in self.feat_map:
+                    col_to_idx[col] = self.feat_map[col]
+                    
+        if not col_to_idx:
+            return
+
+        # 2. Bulk Assignment in Chunks
+        src_cols = list(col_to_idx.keys())
+        dst_idxs = list(col_to_idx.values())
+        
+        n_rows = len(df)
+        chunk_size = 5000 # Process 5000 rows at a time
+        
+        for start in range(0, n_rows, chunk_size):
+            end = min(start + chunk_size, n_rows)
+            
+            # Extract values: (Chunk_Size, N_Matched_Cols)
+            vals = df.iloc[start:end][src_cols].values.astype(np.float32)
+            
+            # Assign to Memmap: X[rows, specific_cols]
+            # Numpy memmap supports basic fancy indexing for assignment
+            X_mmap[start:end, dst_idxs] = vals
+
+def predict_pipeline(
+    artifact_dir: str,
+    input_path: str,
+    output_path: str,
+    input_chalm: Optional[str] = None,
+    input_camda: Optional[str] = None,
+    input_pc: Optional[str] = None
+):
+    """
+    Executes the full HeteroAge-Clock inference pipeline.
+    1. Assemble Data (Beta + Modalities) -> Memmap
+    2. Stage 1 Inference -> OOF/Resid
+    3. Stage 2 Inference -> Expert Resids
+    4. Stage 3 Inference -> Final Fusion
+    """
+    log(">>> Starting End-to-End Inference Pipeline")
+    
+    # 0. Setup Temp Workspace
+    # We create a temp folder next to the output file to store intermediate artifacts
+    temp_dir = os.path.join(os.path.dirname(output_path), "temp_inference_workspace")
+    if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
     
     try:
-        numeric_features = _get_sparse_numeric_features(artifact_dir)
-        mmap_path, meta_path = _merge_to_memmap_sparse(input_path, kwargs.get('input_chalm'), 
-                                                       kwargs.get('input_camda'), kwargs.get('input_pc'), 
-                                                       os.path.dirname(output_path), numeric_features)
+        # --- 1. Load Metadata & Init Assembler ---
+        log(f"Loading main input: {input_path}")
+        if input_path.endswith('.csv'):
+            main_df = pd.read_csv(input_path)
+        else:
+            main_df = pd.read_pickle(input_path)
+            
+        # Robust ID handling
+        if 'sample_id' not in main_df.columns:
+            if main_df.index.name == 'sample_id':
+                main_df = main_df.reset_index()
+            else:
+                log("Warning: No 'sample_id' found. Generating sequential IDs.")
+                main_df['sample_id'] = [f"sample_{i}" for i in range(len(main_df))]
         
-        # Execute Stages
-        predict_stage1(os.path.join(artifact_dir, "stage1"), mmap_path, meta_path, s1_out, numeric_features)
-        predict_stage2(os.path.join(artifact_dir, "stage2"), mmap_path, meta_path, s2_out, numeric_features)
+        main_df['sample_id'] = main_df['sample_id'].astype(str)
         
-        # Merge S1 and S2 for S3 input
-        df_meta = pd.read_pickle(meta_path)
+        # Save lightweight meta for stages (only IDs needed for alignment)
+        meta_path = os.path.join(temp_dir, "meta.pkl")
+        main_df[['sample_id']].to_pickle(meta_path) 
+        
+        # Load Feature Definition from Stage 1 Artifacts
+        # We need to know the exact feature order of the trained model
+        s1_artifact = Stage1Artifact(artifact_dir)
+        all_features = s1_artifact.load("stage1_features")
+        if isinstance(all_features, pd.Index): all_features = all_features.tolist()
+        
+        # Assemble Matrix (Beta -> X.dat)
+        assembler = InferenceDataAssembler(temp_dir, all_features)
+        mmap_path = assembler.assemble(main_df, input_chalm, input_camda, input_pc)
+        
+        # --- 2. Stage 1 Inference ---
+        s1_out = os.path.join(temp_dir, "stage1_pred.csv")
+        # Call strict signature: (artifact_dir, mmap_path, meta_path, output_path, all_features)
+        predict_stage1(artifact_dir, mmap_path, meta_path, s1_out, all_features)
+        
+        # --- 3. Stage 2 Inference ---
+        s2_out = os.path.join(temp_dir, "stage2_pred.csv")
+        # Call strict signature: (stage1_dir, stage2_dir, mmap_path, meta_path, output_path, all_features)
+        # Note: We assume all artifacts (S1 and S2) are in the same 'artifact_dir' folder
+        predict_stage2(artifact_dir, artifact_dir, mmap_path, meta_path, s2_out, all_features)
+        
+        # --- 4. Stage 3 Inference ---
+        # Stage 3 needs a merged input (S1 Predictions + S2 Residuals + PCs)
+        
         df_s1 = pd.read_csv(s1_out)
         df_s2 = pd.read_csv(s2_out)
         
-        s3_input_df = pd.merge(df_meta, df_s1, on='sample_id').merge(df_s2, on='sample_id')
-        s3_temp_path = output_path + ".s3_in.pkl"
-        s3_input_df.to_pickle(s3_temp_path)
+        # Merge S1 and S2
+        df_merged = pd.merge(df_s1, df_s2, on="sample_id")
         
-        predict_stage3(os.path.join(artifact_dir, "stage3"), s3_temp_path, s3_out)
+        # Merge PCs if available (Stage 3 might use them)
+        if input_pc and os.path.exists(input_pc):
+            df_pc = pd.read_csv(input_pc)
+            pc_cols = [c for c in df_pc.columns if c.startswith('RF_PC')]
+            
+            if 'sample_id' in df_pc.columns:
+                df_pc['sample_id'] = df_pc['sample_id'].astype(str)
+                df_merged = pd.merge(df_merged, df_pc[['sample_id'] + pc_cols], on="sample_id", how="left")
+            else:
+                log("Warning: PC file missing 'sample_id'. Skipping PC merge for Stage 3.")
+
+        # Save merged input for Stage 3
+        s3_input = os.path.join(temp_dir, "stage3_input.csv")
+        df_merged.to_csv(s3_input, index=False)
         
-        # FINAL GRAND MERGE
-        log("--- Finalizing Comprehensive Output ---")
-        df_s3 = pd.read_csv(s3_out)
-        final_df = pd.merge(s3_input_df, df_s3[['sample_id', 'pred_residual_stage3', 'HeteroAge']], on='sample_id')
+        # Run S3
+        predict_stage3(artifact_dir, s3_input, output_path)
         
-        # Calculate Stage 1 Residual
-        age_col = 'age' if 'age' in final_df.columns else 'Age'
-        if age_col in final_df.columns:
-            final_df['pred_residual_stage1'] = final_df[age_col] - final_df['pred_age_stage1']
+        log(f"Pipeline Finished. Results saved to: {output_path}")
         
-        final_df.to_csv(output_path, index=False)
-        log(f"=== Success: Full results saved to {output_path} ===")
-        
-    except Exception as e:
-        log(f"❌ Failed: {e}"); raise e
     finally:
-        for f in [s1_out, s2_out, s3_out, s3_temp_path, mmap_path, meta_path]:
-            if f and os.path.exists(f): os.remove(f)
-        gc.collect()
+        # Cleanup Temp Workspace
+        if os.path.exists(temp_dir):
+            try:
+                gc.collect() # Ensure memmap handles are closed
+                shutil.rmtree(temp_dir)
+                log("Cleaned up temporary inference files.")
+            except Exception as e:
+                log(f"Warning: Failed to clean temp dir: {e}")
