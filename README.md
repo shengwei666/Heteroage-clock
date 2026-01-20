@@ -40,15 +40,6 @@ The system utilizes a hierarchical approach to balance global population trends 
 ---
 
 ## ✨ 2. Installation
-### 🛠️ Tech Stack & Core Dependencies
-
-| Category | Library | Purpose |
-| :--- | :--- | :--- |
-| **Machine Learning** | `scikit-learn` | ElasticNet engine for Stage 1 & 2. |
-| **Gradient Boosting** | `LightGBM` | Meta-learner for Stage 3 fusion. |
-| **Data Processing** | `pandas`, `numpy` | High-performance matrix manipulation. |
-| **Serialization** | `joblib`, `pickle` | Artifact deployment and model persistence. |
-| **Bioinformatics** | `pyarrow` | Optimized Parquet I/O for large methylome data. |
 
 ### Option A: Install from Source
 If you want to use the latest version or modify the code, install in **editable mode**:
